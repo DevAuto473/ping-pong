@@ -254,11 +254,11 @@ int main(int argc, char** argv) {
                 lastLog = t;
                 std::printf("t=%6.1fs fps=%5.1f face=%d hr=%5.1f bpm conf=%3.0f%% rmssd=%5.1fms "
                             "resp=%4.1f brpm(%3.0f%%) | eyes: frames=%ld ear=%.3f mean=%.3f thr=%.3f "
-                            "blinks=%d rate=%4.1f/min incompl=%d long=%d perclos=%4.1f%%\n",
+                            "blinks=%d (last min=%.2f) rate=%4.1f/min incompl=%d long=%d perclos=%4.1f%%\n",
                             t, fps, face.valid ? 1 : 0, sm.valid ? sm.bpm : 0.0, sm.confidence * 100.0,
                             sm.rmssdMs, sm.respValid ? sm.respRate : 0.0, sm.respConfidence * 100.0,
                             om.framesProcessed, om.ear, om.meanEar, om.threshold, om.totalBlinks,
-                            om.blinkRate, om.incompleteBlinks, om.longClosures, om.perclos * 100.0);
+                            om.lastBlinkMinRatio, om.blinkRate, om.incompleteBlinks, om.longClosures, om.perclos * 100.0);
                 std::fflush(stdout);
             }
             if (headless && savePath.empty()) continue;

@@ -67,6 +67,7 @@ struct OcularMetrics {
     int longClosures = 0;       ///< Closures longer than the maximum blink (micro-sleep cue).
     double perclos = 0.0;       ///< 0..1 fraction of frames "closed" in the last 60 s.
     double lastBlinkDurationMs = 0.0;
+    double lastBlinkMinRatio = 0.0; ///< Deepest EAR / mean of the last blink (diagnostic for tuning).
     long framesProcessed = 0;   ///< Frames that actually reached the analyzer (diagnostics).
 };
 

@@ -138,6 +138,7 @@ void OcularAnalyzer::updateBlinkState(double ear, double t) {
         ++metrics_.totalBlinks;
         if (!complete) ++metrics_.incompleteBlinks;
         metrics_.lastBlinkDurationMs = durMs;
+        metrics_.lastBlinkMinRatio = closureMinEar_ / std::max(mean, 1e-9);
     } else if (closureFrames_ > maxF) {
         ++metrics_.longClosures;
         metrics_.lastBlinkDurationMs = durMs;
