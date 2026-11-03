@@ -7,12 +7,19 @@
 //                  ─► zero-mean detrending (moving-average baseline removal)
 //                  ─► zero-phase Butterworth band-pass 0.75–2.5 Hz (filtfilt)
 //                  ─► Hamming window + zero padding + cv::dft
-//                  ─► spectral peak (parabolic interpolation) ─► BPM + SNR confidence
+//                  ─► spectral peak (parabolic interpolation) ─► BPM
+//                  ─► confidence = clamp(peak-lobe power / band power · norm, 0, 1)
 //                  ─► time-domain peak detection ─► IBI ─► RMSSD (HRV)
+//
+//   Respiration (BrPM) uses a separate, longer buffer of the *undetrended*
+//   green signal (the cardiac detrender would remove the breathing baseline):
+//     normalise ─► linear detrend ─► band-pass 0.15–0.40 Hz (filtfilt)
+//               ─► Hamming + cv::dft peak (+ zero-crossing cross-check)
 // ============================================================================
 #include <opencv2/core.hpp>
 
 #include <cstddef>
+#include <deque>
 #include <vector>
 
 namespace vitals {
@@ -66,6 +73,24 @@ struct SignalConfig {
     double maxGapSec = 2.0;         ///< Pauses longer than this flush the buffer.
     double bpmSmoothing = 0.25;     ///< EMA weight for the reported BPM.
     std::size_t waveformSeconds = 8;///< Length of filtered waveform exported to the UI.
+
+    // Confidence = clamp(lobePower / bandPower · confNorm, 0, 1).
+    double confLobeHz = 0.12;       ///< Half-width of the "peak" lobe (Hamming main lobe).
+    double confNorm = 1.0 / 0.80;   ///< A lobe holding ≥ 80 % of the band power ⇒ 100 %.
+
+    // Respiratory rate (baseline modulation of the green channel).
+    std::size_t respBufferSize = 1024; ///< ≈ 34 s @ 30 FPS (≥ 4 breaths at 7 BrPM).
+    double respMinSeconds = 15.0;      ///< Data span required for the first estimate.
+    double respLowHz = 0.15;           ///< 9 breaths/min
+    double respHighHz = 0.40;          ///< 24 breaths/min
+    double respLobeHz = 0.05;
+    double respConfFull = 0.85;        ///< Lobe/band power ratio that maps to 100 %.
+    double respRefLowHz = 0.45;        ///< Reference band for the noise floor (above breathing,
+    double respRefHighHz = 0.70;       ///< below the cardiac band).
+    double respMinPeakDb = 10.0;       ///< Peak must exceed the reference median by this much.
+    double respMinConfidence = 0.55;   ///< Below this the estimate is reported as invalid.
+    double respSmoothing = 0.30;
+    std::size_t respStabilityFrames = 150;  ///< ≈ 5 s of consecutive estimates must agree.
 };
 
 struct SignalMetrics {
@@ -80,6 +105,12 @@ struct SignalMetrics {
     int beatCount = 0;
     double sampleRate = 0.0;    ///< Effective (measured) sampling rate.
     double bufferFill = 0.0;    ///< 0..1 progress of signal acquisition.
+    // Respiration (breaths per minute).
+    bool respValid = false;
+    double respRate = 0.0;          ///< Smoothed BrPM.
+    double respConfidence = 0.0;    ///< 0..1 (clamped).
+    double respProgress = 0.0;      ///< 0..1 acquisition progress toward respMinSeconds.
+
     std::vector<float> waveform;      ///< Filtered pulse, normalised to [-1, 1], oldest first.
     std::vector<float> beatMarkers;   ///< Beat positions inside `waveform`, as 0..1 fractions.
 };
@@ -101,16 +132,30 @@ public:
 private:
     struct Sample { double v; double t; };
 
-    bool resampleUniform(std::vector<double>& out, double& fs) const;
+    struct Spectrum {
+        double peakHz = 0.0;
+        double ratio = 0.0;     ///< lobe power / total band power, 0..1
+        double snrDb = 0.0;     ///< lobe power vs. remaining band power
+        double peakToRefDb = 0.0; ///< peak bin vs. median bin of the reference band (if requested)
+    };
+
+    static bool resampleUniform(const CircularBuffer<Sample>& buf, std::vector<double>& out, double& fs);
     static void detrend(std::vector<double>& x, int window);
-    void bandpass(std::vector<double>& x, double fs) const;
-    bool spectralPeak(const std::vector<double>& x, double fs,
-                      double& peakHz, double& snrDb) const;
+    static void removeLinearTrend(std::vector<double>& x);
+    /// Zero-phase Butterworth band-pass; `sections` biquads per edge.
+    static void bandpass(std::vector<double>& x, double fs, double lo, double hi, int sections);
+    /// Hamming + zero-padded cv::dft; peak search and power ratio inside [lo, hi].
+    /// If refHi > refLo, also computes the peak-to-median ratio against that reference band.
+    static bool spectrum(const std::vector<double>& x, double fs, double lo, double hi,
+                         double lobeHz, int nfftMin, Spectrum& out, double refLo = 0.0,
+                         double refHi = 0.0);
+    void processRespiration();
     void computeHrv(const std::vector<double>& x, double fs, double hrHz,
                     std::vector<double>& peakIdx);
 
     SignalConfig cfg_;
     CircularBuffer<Sample> buffer_;
+    CircularBuffer<Sample> respBuffer_;   ///< Same timeline, longer history.
     SignalMetrics metrics_;
 
     bool paused_ = false;
@@ -120,6 +165,8 @@ private:
     double lastRaw_ = 0.0;
     double lastT_ = -1.0;
     double smoothedBpm_ = 0.0;
+    double smoothedResp_ = 0.0;
+    std::deque<double> respHistory_;
 };
 
 }  // namespace vitals

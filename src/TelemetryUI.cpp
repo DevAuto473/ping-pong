@@ -140,53 +140,57 @@ void TelemetryUI::drawHeader(cv::Mat& frame, const UiFrameState& st) const {
 }
 
 void TelemetryUI::drawCards(cv::Mat& frame, const cv::Rect& panel, const UiFrameState& st) const {
-    const double s = frame.rows / 720.0;
-    const int gap = static_cast<int>(10 * s);
-    const int cardH = (panel.height - 3 * gap) / 4;
+    constexpr int kCards = 5;
+    const double base = frame.rows / 720.0;
+    const int gap = static_cast<int>(8 * base);
+    const int cardH = (panel.height - (kCards - 1) * gap) / kCards;
+    // All offsets inside a card scale with the card height (designed for 112 px @ 720p).
+    const double s = std::min(base, base * cardH / (112.0 * base));
     const bool paused = st.state == SystemState::FaceLost;
     const SignalMetrics* sig = st.signal;
     const OcularMetrics* oc = st.ocular;
+    const auto pct = [](double v) { return std::clamp(v, 0.0, 1.0) * 100.0; };  // never > 100 %
 
     auto card = [&](int idx, const std::string& title, const cv::Scalar& accent) {
         const cv::Rect r(panel.x, panel.y + idx * (cardH + gap), panel.width, cardH);
         blendRect(frame, r, kCard, 0.82);
         cv::rectangle(frame, r, kGrid, 1);
         cv::rectangle(frame, cv::Rect(r.x, r.y, std::max(3, (int)(4 * s)), r.height), accent, cv::FILLED);
-        text(frame, title, {r.x + (int)(14 * s), r.y + (int)(20 * s)}, 0.42 * s, kMuted, 1);
+        text(frame, title, {r.x + (int)(14 * s), r.y + (int)(18 * s)}, 0.42 * s, kMuted, 1);
         return r;
     };
-    const double big = 1.25 * s, unit = 0.5 * s, small = 0.4 * s;
+    const double big = 1.15 * s, unit = 0.5 * s, small = 0.4 * s;
     const int bigTh = std::max(1, (int)(2 * s));
     const cv::Scalar valueCol = paused ? kMuted : kText;
+    auto valuePos = [&](const cv::Rect& r) { return cv::Point(r.x + (int)(14 * s), r.y + (int)(56 * s)); };
+    auto subPos = [&](const cv::Rect& r) { return cv::Point(r.x + (int)(14 * s), r.y + r.height - (int)(9 * s)); };
 
     // --- Heart rate -------------------------------------------------------
     {
         const bool ok = sig && sig->valid;
-        const double conf = ok ? sig->confidence : 0.0;
+        const double conf = ok ? std::clamp(sig->confidence, 0.0, 1.0) : 0.0;
         const cv::Scalar accent = !ok ? kMuted : (conf > 0.6 ? kPulse : (conf > 0.35 ? kAmber : kRed));
         const cv::Rect r = card(0, "HEART RATE", accent);
-        const cv::Point vp(r.x + (int)(14 * s), r.y + (int)(64 * s));
+        const cv::Point vp = valuePos(r);
         const std::string v = ok ? fmt("%.0f", sig->bpm) : "--";
         const cv::Size vs = text(frame, v, vp, big, ok ? valueCol : kMuted, bigTh, kFontBold);
         text(frame, "BPM", vp + cv::Point(vs.width + (int)(6 * s), 0), unit, kMuted, 1);
-
-        // Beating heart indicator driven by the live waveform.
         if (sig && !sig->waveform.empty() && !paused) {
             const double a = std::max(0.0, static_cast<double>(sig->waveform.back()));
-            const cv::Point c(r.x + r.width - (int)(30 * s), r.y + (int)(48 * s));
-            cv::circle(frame, c, (int)((7 + 6 * a) * s), kRed, cv::FILLED, cv::LINE_AA);
+            const cv::Point c(r.x + r.width - (int)(30 * s), r.y + (int)(42 * s));
+            cv::circle(frame, c, (int)((6 + 5 * a) * s), kRed, cv::FILLED, cv::LINE_AA);
         }
-        const cv::Rect cb(r.x + (int)(14 * s), r.y + r.height - (int)(22 * s), r.width - (int)(80 * s),
+        const cv::Rect cb(r.x + (int)(14 * s), r.y + r.height - (int)(20 * s), r.width - (int)(90 * s),
                           std::max(3, (int)(5 * s)));
         bar(frame, cb, conf, accent);
-        text(frame, fmt("Q %.0f%%", conf * 100.0), {cb.x + cb.width + (int)(8 * s), cb.y + (int)(6 * s)},
+        text(frame, fmt("CONF %.0f%%", pct(conf)), {cb.x + cb.width + (int)(8 * s), cb.y + (int)(7 * s)},
              small, kMuted, 1);
     }
     // --- HRV ----------------------------------------------------------------
     {
         const bool ok = sig && sig->valid && sig->rmssdMs > 0.0;
         const cv::Rect r = card(1, "HRV  (RMSSD)", kCyan);
-        const cv::Point vp(r.x + (int)(14 * s), r.y + (int)(64 * s));
+        const cv::Point vp = valuePos(r);
         const cv::Size vs = text(frame, ok ? fmt("%.0f", sig->rmssdMs) : "--", vp, big,
                                  ok ? valueCol : kMuted, bigTh, kFontBold);
         text(frame, "ms", vp + cv::Point(vs.width + (int)(6 * s), 0), unit, kMuted, 1);
@@ -194,51 +198,69 @@ void TelemetryUI::drawCards(cv::Mat& frame, const cv::Rect& panel, const UiFrame
                                     ? fmt("IBI %.0f ms", sig->meanIbiMs) + "   beats " +
                                           std::to_string(sig->beatCount)
                                     : "collecting beats...";
-        text(frame, sub, {r.x + (int)(14 * s), r.y + r.height - (int)(12 * s)}, small, kMuted, 1);
+        text(frame, sub, subPos(r), small, kMuted, 1);
+    }
+    // --- Respiration ----------------------------------------------------------
+    {
+        const bool ok = sig && sig->respValid;
+        const cv::Scalar accent = !ok ? kMuted : (sig->respConfidence > 0.5 ? kCyan : kAmber);
+        const cv::Rect r = card(2, "RESP RATE", accent);
+        const cv::Point vp = valuePos(r);
+        const cv::Size vs = text(frame, ok ? fmt("%.0f", sig->respRate) : "--", vp, big,
+                                 ok ? valueCol : kMuted, bigTh, kFontBold);
+        text(frame, "BrPM", vp + cv::Point(vs.width + (int)(6 * s), 0), unit, kMuted, 1);
+        if (ok) {
+            text(frame, fmt("CONF %.0f%%", pct(sig->respConfidence)), subPos(r), small, kMuted, 1);
+        } else {
+            const double prog = sig ? sig->respProgress : 0.0;
+            text(frame, prog < 1.0 ? "acquiring " + std::to_string(static_cast<int>(pct(prog))) + "%"
+                                   : "weak breathing signal",
+                 subPos(r), small, kMuted, 1);
+        }
     }
     // --- Blink rate ---------------------------------------------------------
     {
         const bool ok = oc && oc->valid;
         const cv::Scalar accent = !ok ? kMuted : ((oc->blinkRate < 8.0 || oc->blinkRate > 30.0) ? kAmber : kViolet);
-        const cv::Rect r = card(2, "BLINK RATE", accent);
-        const cv::Point vp(r.x + (int)(14 * s), r.y + (int)(64 * s));
+        const cv::Rect r = card(3, "BLINK RATE", accent);
+        const cv::Point vp = valuePos(r);
         const cv::Size vs = text(frame, ok ? fmt("%.0f", oc->blinkRate) : "--", vp, big,
                                  ok ? valueCol : kMuted, bigTh, kFontBold);
         text(frame, "/min", vp + cv::Point(vs.width + (int)(6 * s), 0), unit, kMuted, 1);
         if (ok) {
-            // Live EAR gauge.
-            const cv::Rect eb(r.x + r.width - (int)(70 * s), r.y + (int)(40 * s), (int)(56 * s),
+            const cv::Rect eb(r.x + r.width - (int)(80 * s), r.y + (int)(36 * s), (int)(66 * s),
                               std::max(3, (int)(5 * s)));
             bar(frame, eb, oc->ear / 0.36, oc->eyesClosed ? kRed : kViolet);
+            const double thrX = std::clamp(oc->threshold / 0.36, 0.0, 1.0);
+            cv::line(frame, {eb.x + (int)(thrX * eb.width), eb.y - 3}, {eb.x + (int)(thrX * eb.width), eb.y + eb.height + 3},
+                     kText, 1);
             text(frame, fmt("EAR %.2f", oc->ear), {eb.x, eb.y + (int)(20 * s)}, small, kMuted, 1);
-            const std::string sub = "incomplete " + std::to_string(oc->incompleteBlinks) + " (" +
-                                    fmt("%.0f%%", oc->incompleteRatio * 100.0) + ")  total " +
-                                    std::to_string(oc->totalBlinks);
-            text(frame, sub, {r.x + (int)(14 * s), r.y + r.height - (int)(12 * s)}, small, kMuted, 1);
+            const std::string sub = "total " + std::to_string(oc->totalBlinks) + "  incomplete " +
+                                    std::to_string(oc->incompleteBlinks);
+            text(frame, sub, subPos(r), small, kMuted, 1);
         } else {
-            text(frame, "calibrating eye baseline...", {r.x + (int)(14 * s), r.y + r.height - (int)(12 * s)},
-                 small, kMuted, 1);
+            text(frame, "calibrating eye baseline...", subPos(r), small, kMuted, 1);
         }
     }
     // --- PERCLOS --------------------------------------------------------------
     {
         const bool ok = oc && oc->valid;
-        const double p = ok ? oc->perclos : 0.0;
+        const double p = ok ? std::clamp(oc->perclos, 0.0, 1.0) : 0.0;
         // Common drowsiness bands: <7.5 % alert, 7.5–15 % questionable, >15 % drowsy.
         const cv::Scalar accent = !ok ? kMuted : (p < 0.075 ? kPulse : (p < 0.15 ? kAmber : kRed));
         const std::string label = !ok ? "" : (p < 0.075 ? "ALERT" : (p < 0.15 ? "FATIGUE?" : "DROWSY"));
-        const cv::Rect r = card(3, "PERCLOS  (P80, 60 s)", accent);
-        const cv::Point vp(r.x + (int)(14 * s), r.y + (int)(64 * s));
+        const cv::Rect r = card(4, "PERCLOS  (60 s)", accent);
+        const cv::Point vp = valuePos(r);
         const cv::Size vs = text(frame, ok ? fmt("%.1f", p * 100.0) : "--", vp, big,
                                  ok ? valueCol : kMuted, bigTh, kFontBold);
         text(frame, "%", vp + cv::Point(vs.width + (int)(6 * s), 0), unit, kMuted, 1);
         if (ok) {
             int bl = 0;
             const cv::Size ls = cv::getTextSize(label, kFontBold, 0.5 * s, 1, &bl);
-            text(frame, label, {r.x + r.width - ls.width - (int)(12 * s), vp.y - (int)(10 * s)}, 0.5 * s,
+            text(frame, label, {r.x + r.width - ls.width - (int)(12 * s), vp.y - (int)(8 * s)}, 0.5 * s,
                  accent, 1, kFontBold);
         }
-        const cv::Rect pb(r.x + (int)(14 * s), r.y + r.height - (int)(22 * s), r.width - (int)(28 * s),
+        const cv::Rect pb(r.x + (int)(14 * s), r.y + r.height - (int)(20 * s), r.width - (int)(28 * s),
                           std::max(3, (int)(5 * s)));
         bar(frame, pb, p / 0.30, accent);  // full scale = 30 %
         const int t1 = pb.x + static_cast<int>(pb.width * 0.075 / 0.30);
@@ -246,8 +268,8 @@ void TelemetryUI::drawCards(cv::Mat& frame, const cv::Rect& panel, const UiFrame
         cv::line(frame, {t1, pb.y - 2}, {t1, pb.y + pb.height + 2}, kText, 1);
         cv::line(frame, {t2, pb.y - 2}, {t2, pb.y + pb.height + 2}, kText, 1);
         if (ok && oc->longClosures > 0)
-            text(frame, "long closures " + std::to_string(oc->longClosures),
-                 {pb.x, pb.y + (int)(16 * s)}, small, kRed, 1);
+            text(frame, "long closures " + std::to_string(oc->longClosures), {pb.x + (int)(100 * s), vp.y}, small,
+                 kRed, 1);
     }
 }
 

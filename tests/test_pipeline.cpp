@@ -69,22 +69,24 @@ void testPauseResume() {
     EXPECT(!sp.metrics().valid && sp.metrics().bufferFill < 0.05, "long gap should reset buffer");
 }
 
-cv::Mat eyeImage(double openness) {
+cv::Mat eyeImage(double openness, int gazeDx = 0, double gain = 1.0) {
     cv::Mat img(480, 640, CV_8UC1, cv::Scalar(170));  // skin
     for (cv::Point c : {cv::Point(220, 240), cv::Point(420, 240)}) {
+        cv::line(img, c + cv::Point(-36, -34), c + cv::Point(36, -38), cv::Scalar(80), 4, cv::LINE_AA);  // eyebrow
         const int a = 34, b = static_cast<int>(16 * openness);
         if (b >= 2) {
             cv::ellipse(img, c, {a, b}, 0, 0, 360, cv::Scalar(235), cv::FILLED, cv::LINE_AA);  // sclera
             cv::Mat mask = cv::Mat::zeros(img.size(), CV_8UC1);
             cv::ellipse(mask, c, {a, b}, 0, 0, 360, cv::Scalar(255), cv::FILLED);
             cv::Mat iris = img.clone();
-            cv::circle(iris, c, 13, cv::Scalar(50), cv::FILLED, cv::LINE_AA);
+            cv::circle(iris, c + cv::Point(gazeDx, 0), 13, cv::Scalar(50), cv::FILLED, cv::LINE_AA);
             iris.copyTo(img, mask);
             cv::ellipse(img, c, {a, b}, 0, 180, 360, cv::Scalar(70), 2, cv::LINE_AA);       // upper lid
         } else {
             cv::line(img, c - cv::Point(a, 0), c + cv::Point(a, 0), cv::Scalar(90), 2, cv::LINE_AA);
         }
     }
+    if (gain != 1.0) img.convertTo(img, CV_8UC1, gain);
     return img;
 }
 
@@ -126,6 +128,147 @@ void testOcular() {
     EXPECT(m.longClosures == 1, "long closures %d", m.longClosures);
     EXPECT(m.perclos > 0.02 && m.perclos < 0.12, "perclos %.3f", m.perclos);
 }
+
+/// Confidence must stay inside [0, 1] and fall monotonically with noise.
+void testConfidence() {
+    double prev = 2.0;
+    for (double sigma : {0.1, 0.5, 1.5, 4.0, 20.0}) {
+        vitals::SignalProcessor sp;
+        std::mt19937 rng(11);
+        std::normal_distribution<double> noise(0.0, sigma);
+        double t = 0.0;
+        double minC = 9, maxC = -9;
+        for (int i = 0; i < 600; ++i, t += 1.0 / 30) {
+            sp.push(120.0 + 0.8 * std::sin(2 * kPi * 1.2 * t) + noise(rng), t);
+            const auto& m = sp.process();
+            if (m.valid) { minC = std::min(minC, m.confidence); maxC = std::max(maxC, m.confidence); }
+        }
+        const auto& m = sp.metrics();
+        std::printf("  noise sigma %5.1f -> conf %5.1f%% (range %.2f..%.2f) snr %.1f dB\n", sigma,
+                    m.confidence * 100.0, minC, maxC, m.snrDb);
+        EXPECT(minC >= 0.0 && maxC <= 1.0, "confidence out of [0,1]: %.3f..%.3f", minC, maxC);
+        EXPECT(m.confidence <= prev + 1e-9, "confidence not monotonic (%.3f after %.3f)", m.confidence, prev);
+        prev = m.confidence;
+        if (sigma <= 0.5) EXPECT(m.confidence > 0.9, "clean signal should be ~100%% (%.2f)", m.confidence);
+        if (sigma >= 20.0) EXPECT(m.confidence < 0.5, "noise-only should be low (%.2f)", m.confidence);
+    }
+}
+
+/// Breathing modulates the baseline at 0.25 Hz (15 BrPM) under pulse + drift + noise.
+void testRespiration(double brpm, double fps) {
+    vitals::SignalProcessor sp;
+    std::mt19937 rng(5);
+    std::normal_distribution<double> noise(0.0, 0.25);
+    double t = 0.0;
+    for (int i = 0; i < static_cast<int>(45 * fps); ++i, t += 1.0 / fps) {
+        const double v = 120.0 + 0.6 * std::sin(2 * kPi * (brpm / 60.0) * t + 0.7)      // breathing
+                         + 0.5 * std::sin(2 * kPi * 1.2 * t) + 2.0 * std::sin(2 * kPi * 0.03 * t)  // pulse, drift
+                         + noise(rng);
+        sp.push(v, t);
+        sp.process();
+    }
+    const auto& m = sp.metrics();
+    std::printf("  resp %4.1f BrPM @ %.0f fps -> %.1f BrPM conf %.0f%% valid %d\n", brpm, fps, m.respRate,
+                m.respConfidence * 100.0, m.respValid ? 1 : 0);
+    EXPECT(m.respValid, "respiration not valid");
+    EXPECT(std::abs(m.respRate - brpm) < 2.0, "resp %.1f vs %.1f", m.respRate, brpm);
+    EXPECT(m.respConfidence >= 0.0 && m.respConfidence <= 1.0, "resp conf out of range");
+}
+
+void testRespirationNoiseOnly() {
+    vitals::SignalProcessor sp;
+    std::mt19937 rng(9);
+    std::normal_distribution<double> noise(0.0, 1.0);
+    double t = 0.0;
+    int validFrames = 0, total = 0;
+    for (int i = 0; i < 30 * 90; ++i, t += 1.0 / 30) {
+        sp.push(120.0 + noise(rng), t);
+        const auto& m = sp.process();
+        if (t > 25.0) { ++total; if (m.respValid) ++validFrames; }
+    }
+    std::printf("  resp noise-only: reported valid in %d / %d frames, conf %.0f%%\n", validFrames, total,
+                sp.metrics().respConfidence * 100.0);
+    EXPECT(validFrames < total / 4, "noise reported as respiration in %d / %d frames", validFrames, total);
+}
+
+void testRespirationNotReadyEarly() {
+    vitals::SignalProcessor sp;
+    double t = 0.0;
+    for (int i = 0; i < 300; ++i, t += 1.0 / 30) { sp.push(100 + std::sin(2 * kPi * 0.25 * t), t); sp.process(); }
+    EXPECT(!sp.metrics().respValid && sp.metrics().respProgress < 1.0, "resp must wait for %d s of data", 15);
+}
+
+/// Harder ocular scenario: exposure drift, gaze shifts, 15 / 30 / 60 FPS, blink-free start.
+void testOcularRobust(double fps) {
+    vitals::OcularAnalyzer oa;
+    const cv::Rect le(180, 215, 80, 50), re(380, 215, 80, 50);
+    std::mt19937 rng(21);
+    const int frames = static_cast<int>(60 * fps);
+    int blinksIn = 0;
+    int lastBlinkStart = -1000;
+    double t = 0.0;
+    for (int i = 0; i < frames; ++i, t += 1.0 / fps) {
+        double open = 1.0;
+        // A 180 ms blink every ~3.3 s starting at t = 5 s (first 5 s: no blink at all).
+        const double ts = t - 5.0;
+        const double period = 3.3;
+        if (ts >= 0.0) {
+            const double ph = std::fmod(ts, period);
+            if (ph < 0.18) {
+                open = 1.0 - std::sin(kPi * ph / 0.18);
+                if (i - lastBlinkStart > static_cast<int>(fps)) { ++blinksIn; lastBlinkStart = i; }
+            }
+        }
+        const double gain = 1.0 + 0.15 * std::sin(2 * kPi * 0.07 * t);             // exposure drift
+        const int gaze = static_cast<int>(8 * std::sin(2 * kPi * 0.11 * t));        // gaze wander
+        cv::Mat img = eyeImage(open, gaze, gain), noise(img.size(), CV_16SC1), i16;
+        cv::randn(noise, 0, 3);
+        img.convertTo(i16, CV_16SC1); i16 += noise; i16.convertTo(img, CV_8UC1);
+        oa.update(img, le, re, t);
+    }
+    const auto& m = oa.metrics();
+    std::printf("  [%2.0f fps] blinks in %d -> detected %d  rate %.1f/min  perclos %.1f%%  ear %.2f mean %.2f thr %.2f"
+                "  long %d\n", fps, blinksIn, m.totalBlinks, m.blinkRate, m.perclos * 100.0, m.ear, m.meanEar,
+                m.threshold, m.longClosures);
+    EXPECT(m.valid, "ocular not valid");
+    EXPECT(m.framesProcessed > frames - 5, "frames reached analyzer: %ld / %d", m.framesProcessed, frames);
+    EXPECT(m.meanEar > 0.15 && m.meanEar < 0.5, "mean EAR %.3f not in the plausible open-eye range", m.meanEar);
+    EXPECT(std::abs(m.totalBlinks - blinksIn) <= 2, "blinks %d vs %d", m.totalBlinks, blinksIn);
+    EXPECT(m.blinkRate > 10.0 && m.blinkRate < 25.0, "blink rate %.1f", m.blinkRate);
+    EXPECT(m.perclos > 0.0 && m.perclos < 0.10, "perclos %.3f", m.perclos);
+}
+
+/// Eyes shut for most of the window must produce a high PERCLOS (drowsy) and long closures.
+void testOcularDrowsy() {
+    vitals::OcularAnalyzer oa;
+    const cv::Rect le(180, 215, 80, 50), re(380, 215, 80, 50);
+    double t = 0.0;
+    for (int i = 0; i < 30 * 60; ++i, t += 1.0 / 30) {
+        // 6 s open, then cycles of 2 s closed / 3 s open.
+        const double ts = t - 6.0;
+        const bool closed = ts > 0.0 && std::fmod(ts, 5.0) < 2.0;
+        oa.update(eyeImage(closed ? 0.0 : 1.0), le, re, t);
+    }
+    const auto& m = oa.metrics();
+    std::printf("  drowsy: perclos %.1f%% long closures %d blinks %d\n", m.perclos * 100.0, m.longClosures,
+                m.totalBlinks);
+    EXPECT(m.perclos > 0.25 && m.perclos < 0.45, "perclos %.3f (expected ≈ 0.36)", m.perclos);
+    EXPECT(m.longClosures >= 8, "long closures %d", m.longClosures);
+}
+
+void testOcularPauseGap() {
+    vitals::OcularAnalyzer oa;
+    const cv::Rect le(180, 215, 80, 50), re(380, 215, 80, 50);
+    double t = 0.0;
+    for (int i = 0; i < 150; ++i, t += 1.0 / 30) oa.update(eyeImage(1.0), le, re, t);
+    const long before = oa.metrics().framesProcessed;
+    oa.pause(t);
+    t += 8.0;  // face lost for 8 s with the eyes "closed" — must be ignored entirely
+    for (int i = 0; i < 90; ++i, t += 1.0 / 30) oa.update(eyeImage(1.0), le, re, t);
+    const auto& m = oa.metrics();
+    EXPECT(m.framesProcessed == before + 90, "frame counting after pause");
+    EXPECT(m.totalBlinks == 0 && m.longClosures == 0, "a tracking gap must not create blink events");
+}
 }  // namespace
 
 int main() {
@@ -135,8 +278,21 @@ int main() {
     testHeartRate(95, 25);
     testHeartRate(130, 30);
     testPauseResume();
+    std::printf("[Confidence]\n");
+    testConfidence();
+    std::printf("[Respiration]\n");
+    testRespiration(15, 30);
+    testRespiration(10, 30);
+    testRespiration(22, 25);
+    testRespirationNotReadyEarly();
+    testRespirationNoiseOnly();
     std::printf("[OcularAnalyzer]\n");
     testOcular();
+    testOcularRobust(15);
+    testOcularRobust(30);
+    testOcularRobust(60);
+    testOcularDrowsy();
+    testOcularPauseGap();
     std::printf(gFailures ? "%d FAILURE(S)\n" : "ALL TESTS PASSED\n", gFailures);
     return gFailures ? 1 : 0;
 }
