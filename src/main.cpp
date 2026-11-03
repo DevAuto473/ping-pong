@@ -1,6 +1,7 @@
 // ============================================================================
 //  vitals_monitor — contactless rPPG heart rate + ocular fatigue monitor.
 // ============================================================================
+#include "ClinicalAnalytics.hpp"
 #include "FaceTracker.hpp"
 #include "OcularAnalyzer.hpp"
 #include "SignalProcessor.hpp"
@@ -49,7 +50,11 @@ const char* kKeys =
     "{method         | pos  | pulse extraction: pos (illumination robust) or green }"
     "{save           |      | write the HUD preview to a video file (e.g. out.mp4)  }"
     "{log            | 0    | print telemetry every N seconds (0 = off)            }"
-    "{max-motion     | 0.08 | face motion (x IOD per frame) that pauses sampling   }";
+    "{max-motion     | 0.08 | face motion (x IOD per frame) that pauses sampling   }"
+    "{max-rot-speed  | 30   | head rotation speed (deg/s) that pauses sampling     }"
+    "{spo2-a         | 110  | SpO2 = A - B*R calibration intercept (uncalibrated)  }"
+    "{spo2-b         | 25   | SpO2 = A - B*R calibration slope (uncalibrated)      }"
+    "{report         | true | print the clinical telemetry report on exit         }";
 
 /// Camera / video source with automatic reconnection.
 class FrameSource {
@@ -142,6 +147,8 @@ int main(int argc, char** argv) {
     const bool headless = parser.get<bool>("headless");
     const double logEvery = parser.get<double>("log");
     const double maxMotion = parser.get<double>("max-motion");
+    const double maxRotSpeed = parser.get<double>("max-rot-speed");
+    const bool printReport = parser.get<bool>("report");
     const std::string savePath = parser.has("save") ? parser.get<std::string>("save") : "";
     const int bufferLen = std::max(256, std::min(512, parser.get<int>("buffer")));
     if (!parser.check()) {
@@ -163,6 +170,10 @@ int main(int argc, char** argv) {
         scfg.method = method == "green" ? vitals::PulseMethod::Green : vitals::PulseMethod::POS;
         vitals::SignalProcessor signal(scfg);
         vitals::OcularAnalyzer ocular;
+        vitals::ClinicalConfig ccfg;
+        ccfg.spo2A = parser.get<double>("spo2-a");
+        ccfg.spo2B = parser.get<double>("spo2-b");
+        vitals::ClinicalAnalytics analytics(ccfg);
         vitals::TelemetryUI ui;
 
         FrameSource source(camIndex, video, parser.get<int>("width"), parser.get<int>("height"),
@@ -229,17 +240,20 @@ int main(int argc, char** argv) {
             if (dt > 0.0) fps = fps <= 0.0 ? 1.0 / dt : 0.9 * fps + 0.1 / dt;
 
             // ---- Tracking + feature extraction.
-            const vitals::FaceObservation face = tracker.update(frame);
+            const vitals::FaceObservation face = tracker.update(frame, t);
             vitals::SystemState state = vitals::SystemState::Acquiring;
             std::string status;
+            bool motionRejected = false;
             if (face.valid) {
-                const bool stable = face.motion <= maxMotion;
-                cv::Vec3d skin;
-                if (stable && vitals::SignalProcessor::skinMean(
-                                  frame, {face.forehead, face.leftCheek, face.rightCheek}, skin)) {
-                    signal.push(skin, t);  // B, G, R → POS (or green in --method=green)
+                // Translation and head-rotation speed both corrupt the rPPG trace:
+                // freeze the buffers (they resume, spliced, once the head is still).
+                motionRejected = face.motion > maxMotion || face.angularSpeedDps > maxRotSpeed;
+                if (!motionRejected) {
+                    signal.push(vitals::SignalProcessor::sampleFrame(
+                                    frame, {face.forehead, face.leftCheek, face.rightCheek},
+                                    {face.backgroundLeft, face.backgroundRight}),
+                                t);
                 } else {
-                    // Gross motion corrupts the rPPG trace: hold the buffer briefly.
                     signal.pause(t);
                 }
                 cv::cvtColor(frame, gray, cv::COLOR_BGR2GRAY);
@@ -254,16 +268,10 @@ int main(int argc, char** argv) {
             if (face.valid) state = sm.valid ? vitals::SystemState::Running : vitals::SystemState::Acquiring;
 
             const vitals::OcularMetrics& om = ocular.metrics();
+            analytics.update(t, sm, om, face.valid, motionRejected);
             if (logEvery > 0.0 && t - lastLog >= logEvery) {
                 lastLog = t;
-                std::printf("t=%6.1fs fps=%5.1f face=%d hr=%5.1f bpm conf=%3.0f%% rmssd=%5.1fms "
-                            "resp=%4.1f brpm(%3.0f%%) | eyes: frames=%ld ear=%.3f mean=%.3f thr=%.3f "
-                            "blinks=%d (last min=%.2f) rate=%4.1f/min incompl=%d long=%d perclos=%4.1f%%\n",
-                            t, fps, face.valid ? 1 : 0, sm.valid ? sm.bpm : 0.0, sm.confidence * 100.0,
-                            sm.rmssdMs, sm.respValid ? sm.respRate : 0.0, sm.respConfidence * 100.0,
-                            om.framesProcessed, om.ear, om.meanEar, om.threshold, om.totalBlinks,
-                            om.lastBlinkMinRatio, om.blinkRate, om.incompleteBlinks, om.longClosures, om.perclos * 100.0);
-                std::fflush(stdout);
+                std::cout << analytics.statusLine(t, sm, om, motionRejected) << std::endl;
             }
             if (headless && savePath.empty()) continue;
 
@@ -309,6 +317,8 @@ int main(int argc, char** argv) {
         }
         source.release();
         if (!headless) cv::destroyAllWindows();
+        // ESC / 'q' / window close / end of video / Ctrl+C all end up here.
+        if (printReport) std::cout << analytics.report() << std::flush;
         std::cout << "Session ended cleanly.\n";
         return 0;
     } catch (const std::exception& e) {

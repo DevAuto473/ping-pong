@@ -67,7 +67,7 @@ void Biquad::process(std::vector<double>& x) const {
 }
 
 // ---------------------------------------------------------------------------
-// SignalProcessor
+// SignalProcessor — input side
 // ---------------------------------------------------------------------------
 SignalProcessor::SignalProcessor(const SignalConfig& cfg)
     : cfg_(cfg),
@@ -84,17 +84,25 @@ void SignalProcessor::reset() {
     metrics_ = SignalMetrics{};
     paused_ = false;
     timeOffset_ = 0.0;
-    levelOffset_ = lastRaw_ = cv::Vec3d(0, 0, 0);
+    levelOffset_.fill(cv::Vec3d(0, 0, 0));
+    lastRaw_.fill(cv::Vec3d(0, 0, 0));
+    haveRaw_.fill(false);
+    bgOffset_ = bgLast_ = cv::Vec3d(0, 0, 0);
+    haveBg_ = false;
     scalarInput_ = false;
     lastT_ = -1.0;
     smoothedBpm_ = 0.0;
     disagreeSince_ = -1.0;
+    ++segment_;           // segment ids stay monotonic across resets
+    lastBeatT_ = -1e9;
+    segmentStartT_ = -1e9;
 }
 
 void SignalProcessor::pause(double t) {
     if (!paused_) {
         paused_ = true;
         pauseStart_ = t;
+        ++segment_;       // beats after the pause must never pair with beats before it
     }
     metrics_.paused = true;
 }
@@ -102,6 +110,67 @@ void SignalProcessor::pause(double t) {
 void SignalProcessor::push(double value, double t) {
     push(cv::Vec3d(value, value, value), t);
     scalarInput_ = true;
+}
+
+void SignalProcessor::push(const cv::Vec3d& bgr, double t) {
+    FrameSample s;
+    s.roi[kForehead] = RoiSample{bgr, 1.0, true};
+    push(s, t);
+}
+
+void SignalProcessor::push(const FrameSample& s, double t) {
+    if (!std::isfinite(t)) return;
+
+    if (paused_) {
+        paused_ = false;
+        const double gap = t - pauseStart_;
+        if (buffer_.empty() || gap > cfg_.maxGapSec) {
+            reset();  // long dropout: old history is no longer phase-coherent
+        } else {
+            // Short dropout: splice the timeline (remove the gap) and re-align each
+            // region's DC level so the detrender does not see a step.
+            double dt = 1.0 / 30.0;
+            if (buffer_.size() > 1)
+                dt = (buffer_.back().t - buffer_[0].t) / static_cast<double>(buffer_.size() - 1);
+            timeOffset_ = t - (buffer_.back().t + dt);
+            for (int k = 0; k < kRoiCount; ++k)
+                if (s.roi[k].valid && haveRaw_[k]) levelOffset_[k] += lastRaw_[k] - s.roi[k].bgr;
+            if (s.hasBackground && haveBg_) bgOffset_ += bgLast_ - s.background;
+        }
+        segmentStartT_ = t - timeOffset_;
+    }
+
+    const double te = t - timeOffset_;
+    if (!buffer_.empty() && te <= buffer_.back().t) return;  // non-monotonic clock
+
+    Sample smp;
+    smp.t = te;
+    const Sample* prev = buffer_.empty() ? nullptr : &buffer_.back();
+    for (int k = 0; k < kRoiCount; ++k) {
+        const RoiSample& r = s.roi[k];
+        const bool ok = r.valid && std::isfinite(r.bgr[0]) && std::isfinite(r.bgr[1]) && std::isfinite(r.bgr[2]);
+        if (ok) {
+            smp.c[k] = r.bgr + levelOffset_[k];
+            lastRaw_[k] = r.bgr;
+            haveRaw_[k] = true;
+        } else {
+            smp.c[k] = prev ? prev->c[k] : cv::Vec3d(0, 0, 0);  // hold; region marked invalid
+        }
+        smp.ok[k] = ok;
+        smp.skin[k] = ok ? static_cast<float>(r.skinFraction) : 0.f;
+    }
+    if (s.hasBackground) {
+        smp.bg = s.background + bgOffset_;
+        smp.bgOk = true;
+        bgLast_ = s.background;
+        haveBg_ = true;
+    } else if (prev) {
+        smp.bg = prev->bg;
+    }
+    buffer_.push(smp);
+    respBuffer_.push(smp);
+    lastT_ = t;
+    metrics_.paused = false;
 }
 
 bool SignalProcessor::skinMean(const cv::Mat& bgr, const std::vector<cv::Rect>& rois, cv::Vec3d& out) {
@@ -113,8 +182,6 @@ bool SignalProcessor::skinMean(const cv::Mat& bgr, const std::vector<cv::Rect>& 
         if (r.area() <= 0) continue;
         const cv::Mat roi = bgr(r);
         cv::cvtColor(roi, ycc, cv::COLOR_BGR2YCrCb);
-        // Broad skin chroma gate (covers light to dark skin), excluding shadows (Y < 40)
-        // and clipped highlights (Y > 240) whose pulsatile modulation is lost.
         cv::inRange(ycc, cv::Scalar(40, 133, 77), cv::Scalar(240, 180, 130), mask);
         const double nm = cv::countNonZero(mask);
         const cv::Scalar mAll = cv::mean(roi);
@@ -131,57 +198,78 @@ bool SignalProcessor::skinMean(const cv::Mat& bgr, const std::vector<cv::Rect>& 
     return true;
 }
 
-void SignalProcessor::push(const cv::Vec3d& bgr, double t) {
-    if (!std::isfinite(bgr[0]) || !std::isfinite(bgr[1]) || !std::isfinite(bgr[2]) || !std::isfinite(t)) return;
-
-    if (paused_) {
-        paused_ = false;
-        const double gap = t - pauseStart_;
-        if (buffer_.empty() || gap > cfg_.maxGapSec) {
-            // Long dropout: the old history is no longer phase-coherent.
-            reset();
-        } else {
-            // Short dropout: splice the timeline (remove the gap) and re-align
-            // the DC level so the detrender does not see a step.
-            double dt = 1.0 / 30.0;
-            if (buffer_.size() > 1) {
-                dt = (buffer_.back().t - buffer_[0].t) / static_cast<double>(buffer_.size() - 1);
-            }
-            timeOffset_ = t - (buffer_.back().t + dt);
-            levelOffset_ += lastRaw_ - bgr;
-        }
+FrameSample SignalProcessor::sampleFrame(const cv::Mat& bgr, const std::array<cv::Rect, kRoiCount>& rois,
+                                         const std::vector<cv::Rect>& background) {
+    FrameSample out;
+    const cv::Rect frame(0, 0, bgr.cols, bgr.rows);
+    cv::Mat ycc, mask;
+    for (int k = 0; k < kRoiCount; ++k) {
+        const cv::Rect r = rois[k] & frame;
+        if (r.area() < 16) continue;
+        const cv::Mat roi = bgr(r);
+        // Broad skin chroma gate (light to dark skin), excluding deep shadow (Y < 40)
+        // and clipped highlights (Y > 240) whose pulsatile modulation is lost.
+        cv::cvtColor(roi, ycc, cv::COLOR_BGR2YCrCb);
+        cv::inRange(ycc, cv::Scalar(40, 133, 77), cv::Scalar(240, 180, 130), mask);
+        const double frac = static_cast<double>(cv::countNonZero(mask)) / r.area();
+        const cv::Scalar m = frac >= 0.25 ? cv::mean(roi, mask) : cv::mean(roi);
+        out.roi[k] = RoiSample{cv::Vec3d(m[0], m[1], m[2]), frac, true};
     }
-
-    const double te = t - timeOffset_;
-    if (!buffer_.empty() && te <= buffer_.back().t) return;  // non-monotonic clock
-    buffer_.push({bgr + levelOffset_, te});
-    respBuffer_.push({bgr + levelOffset_, te});
-    lastRaw_ = bgr;
-    lastT_ = t;
-    metrics_.paused = false;
+    cv::Vec3d sum(0, 0, 0);
+    double area = 0.0;
+    for (const cv::Rect& b0 : background) {
+        const cv::Rect b = b0 & frame;
+        if (b.area() < 64) continue;
+        const cv::Scalar m = cv::mean(bgr(b));
+        sum += cv::Vec3d(m[0], m[1], m[2]) * static_cast<double>(b.area());
+        area += b.area();
+    }
+    if (area > 0.0) {
+        out.background = sum / area;
+        out.hasBackground = true;
+    }
+    return out;
 }
 
-bool SignalProcessor::resampleUniform(const CircularBuffer<Sample>& buffer_, int ch,
-                                      std::vector<double>& out, double& fs) {
-    const std::size_t n = buffer_.size();
+template <typename Getter>
+bool SignalProcessor::resample(const CircularBuffer<Sample>& buf, Getter get, std::vector<double>& out,
+                               double& fs) {
+    const std::size_t n = buf.size();
     if (n < 2) return false;
-    const double t0 = buffer_[0].t, t1 = buffer_.back().t;
+    const double t0 = buf[0].t, t1 = buf.back().t;
     const double span = t1 - t0;
     if (span <= 0.0) return false;
-    fs = static_cast<double>(n - 1) / span;
+    fs = static_cast<double>(n - 1) / span;  // measured, never assumed
     out.resize(n);
     const double step = span / static_cast<double>(n - 1);
     std::size_t j = 0;
     for (std::size_t i = 0; i < n; ++i) {
         const double t = t0 + step * static_cast<double>(i);
-        while (j + 2 < n && buffer_[j + 1].t < t) ++j;
-        const Sample& a = buffer_[j];
-        const Sample& b = buffer_[std::min(j + 1, n - 1)];
+        while (j + 2 < n && buf[j + 1].t < t) ++j;
+        const Sample& a = buf[j];
+        const Sample& b = buf[std::min(j + 1, n - 1)];
         const double dt = b.t - a.t;
         const double u = dt > 0.0 ? std::clamp((t - a.t) / dt, 0.0, 1.0) : 0.0;
-        out[i] = a.c[ch] + u * (b.c[ch] - a.c[ch]);
+        const double va = get(a), vb = get(b);
+        out[i] = va + u * (vb - va);
     }
     return true;
+}
+
+double SignalProcessor::rms(const std::vector<double>& x) {
+    if (x.empty()) return 0.0;
+    double s = 0.0;
+    for (double v : x) s += v * v;
+    return std::sqrt(s / static_cast<double>(x.size()));
+}
+
+void SignalProcessor::normalise(std::vector<double>& x) {
+    if (x.empty()) return;
+    const double m = std::accumulate(x.begin(), x.end(), 0.0) / static_cast<double>(x.size());
+    for (double& v : x) v -= m;
+    const double r = rms(x);
+    if (r > 1e-15)
+        for (double& v : x) v /= r;
 }
 
 std::vector<double> SignalProcessor::pos(const std::vector<double>& b, const std::vector<double>& g,
@@ -343,6 +431,13 @@ bool SignalProcessor::spectrum(const std::vector<double>& x, double fs, double l
     }
     if (total <= 1e-18) return false;
     out.ratio = std::clamp(lobe / total, 0.0, 1.0);
+    // Normalised spectral entropy of the band: 0 = single line, 1 = flat (noise).
+    double h = 0.0;
+    for (int k = kLo; k <= kHi; ++k) {
+        const double q = p[k] / total;
+        if (q > 1e-15) h -= q * std::log(q);
+    }
+    out.entropy = std::clamp(h / std::log(static_cast<double>(kHi - kLo + 1)), 0.0, 1.0);
     const double rest = std::max(total - lobe, 1e-18);
     out.snrDb = 10.0 * std::log10(std::max(lobe, 1e-18) / rest);
 
@@ -447,7 +542,8 @@ void SignalProcessor::processRespiration() {
 
     std::vector<double> x;
     double fs = 0.0;
-    if (!resampleUniform(respBuffer_, 1, x, fs) || fs < 2.0 * cfg_.respHighHz + 1.0) {
+    if (!resample(respBuffer_, [](const Sample& s) { return s.c[kForehead][1]; }, x, fs) ||
+        fs < 2.0 * cfg_.respHighHz + 1.0) {
         metrics_.respValid = false;
         return;
     }
@@ -531,8 +627,112 @@ void SignalProcessor::processRespiration() {
     }
 }
 
+
+// ---------------------------------------------------------------------------
+// SignalProcessor — multi-ROI processing
+// ---------------------------------------------------------------------------
+std::vector<double> SignalProcessor::regionPulse(int k, double fs) const {
+    std::vector<double> b, g, r;
+    double f = 0.0;
+    resample(buffer_, [k](const Sample& s) { return s.c[k][1]; }, g, f);
+    if (cfg_.method == PulseMethod::POS && !scalarInput_) {
+        resample(buffer_, [k](const Sample& s) { return s.c[k][0]; }, b, f);
+        resample(buffer_, [k](const Sample& s) { return s.c[k][2]; }, r, f);
+        std::vector<double> h = pos(b, g, r, static_cast<int>(std::lround(cfg_.posWindowSec * fs)));
+        // Skin reflectance *drops* when blood volume rises, so POS output is inverted
+        // blood volume; flip it so systolic peaks are maxima (needed for morphology).
+        for (double& v : h) v = -v;
+        return h;
+    }
+    const double mean = std::accumulate(g.begin(), g.end(), 0.0) / static_cast<double>(g.size());
+    if (mean > 1e-6)
+        for (double& v : g) v = 1.0 - v / mean;  // same blood-volume orientation
+    return g;
+}
+
+double SignalProcessor::sqiOf(const Spectrum& sp) const {
+    const double snrTerm =
+        std::clamp((sp.ratio - cfg_.sqiRatioNoise) / (cfg_.sqiRatioClean - cfg_.sqiRatioNoise), 0.0, 1.0);
+    const double entTerm =
+        std::clamp((cfg_.sqiEntropyNoise - sp.entropy) / (cfg_.sqiEntropyNoise - cfg_.sqiEntropyClean), 0.0, 1.0);
+    return std::clamp(0.5 * snrTerm + 0.5 * entTerm, 0.0, 1.0);
+}
+
+void SignalProcessor::processRatio(const std::array<double, kRoiCount>& w, double f0) {
+    metrics_.ratioValid = false;
+    double acR = 0.0, acB = 0.0, wsum = 0.0, fs = 0.0;
+    const double lo = std::max(cfg_.lowHz, f0 - 0.25), hi = std::min(cfg_.highHz, f0 + 0.25);
+    for (int k = 0; k < kRoiCount; ++k) {
+        if (w[k] <= 0.0) continue;
+        std::vector<double> r, b;
+        resample(buffer_, [k](const Sample& s) { return s.c[k][2]; }, r, fs);
+        resample(buffer_, [k](const Sample& s) { return s.c[k][0]; }, b, fs);
+        auto acdc = [&](std::vector<double>& x) {
+            const double dc = std::accumulate(x.begin(), x.end(), 0.0) / static_cast<double>(x.size());
+            if (dc <= 1e-6) return 0.0;
+            for (double& v : x) v = v / dc - 1.0;  // AC normalised by DC
+            removeLinearTrend(x);
+            bandpass(x, fs, lo, hi, 2);            // pulsatile component around the HR only
+            return rms(x);
+        };
+        acR += w[k] * acdc(r);
+        acB += w[k] * acdc(b);
+        wsum += w[k];
+    }
+    if (wsum <= 0.0 || acB <= 1e-12 || acR <= 1e-12) return;
+    metrics_.acDcRed = acR / wsum;
+    metrics_.acDcBlue = acB / wsum;
+    metrics_.ratioRB = metrics_.acDcRed / metrics_.acDcBlue;
+    metrics_.ratioValid = true;
+}
+
+void SignalProcessor::processBackground(double f0, const std::vector<double>& faceGreenRel, double fs) {
+    metrics_.backgroundChecked = false;
+    metrics_.ambientSuspect = false;
+    const std::size_t n = buffer_.size();
+    std::size_t okCount = 0;
+    for (std::size_t i = 0; i < n; ++i) okCount += buffer_[i].bgOk ? 1 : 0;
+    if (okCount < static_cast<std::size_t>(0.9 * static_cast<double>(n))) return;
+
+    std::vector<double> g;
+    double f = 0.0;
+    resample(buffer_, [](const Sample& s) { return s.bg[1]; }, g, f);
+    const double mean = std::accumulate(g.begin(), g.end(), 0.0) / static_cast<double>(g.size());
+    if (mean <= 1e-6) return;
+    for (double& v : g) v = v / mean - 1.0;
+    detrend(g, static_cast<int>(std::lround(cfg_.detrendWindowSec * fs)));
+    bandpass(g, fs, cfg_.lowHz, cfg_.highHz, cfg_.filterOrderSections);
+
+    // Look for background energy at the *face* pulse frequency (strong prior on f0).
+    Spectrum sp;
+    metrics_.backgroundChecked = true;
+    if (!spectrum(g, fs, cfg_.lowHz, cfg_.highHz, cfg_.confLobeHz, cfg_.dftMinSize, sp, 0.0, 0.0, f0, 0.05, 0.0)) {
+        metrics_.backgroundRatio = 0.0;
+        return;
+    }
+    metrics_.backgroundRatio = std::abs(sp.peakHz - f0) <= 0.1 ? sp.ratio : 0.0;
+    const double relBg = rms(g), relFace = rms(faceGreenRel);
+    metrics_.ambientSuspect = metrics_.backgroundRatio >= cfg_.ambientMinRatio &&
+                              relBg >= cfg_.ambientMinRelAmp * std::max(relFace, 1e-12);
+}
+
+void SignalProcessor::emitBeats(const std::vector<double>& peaks, double fs) {
+    const double t0 = buffer_[0].t, tEnd = buffer_.back().t;
+    const double newest = tEnd - cfg_.beatConfirmSec;      // filter edge settled before this
+    const double oldest = newest - 1.0;                    // only the "just confirmed" zone
+    for (double p : peaks) {
+        const double tb = t0 + p / fs;
+        if (tb > newest || tb < oldest) continue;
+        if (tb < segmentStartT_ + 0.5) continue;           // too close to a splice
+        if (tb <= lastBeatT_ + 0.25) continue;             // already emitted (allows jitter)
+        metrics_.newBeats.push_back(BeatEvent{tb, segment_});
+        lastBeatT_ = tb;
+    }
+}
+
 const SignalMetrics& SignalProcessor::process() {
     metrics_.paused = paused_;
+    metrics_.newBeats.clear();
     if (paused_) return metrics_;
 
     const std::size_t n = buffer_.size();
@@ -542,50 +742,93 @@ const SignalMetrics& SignalProcessor::process() {
         metrics_.valid = false;
         metrics_.waveform.clear();
         metrics_.beatMarkers.clear();
+        metrics_.morphWave.clear();
         return metrics_;
     }
 
-    // 1. Uniform resampling at the measured rate.
-    std::vector<double> x;
+    // 1. Sampling rate measured from the real timestamps on every call.
+    std::vector<double> probe;
     double fs = 0.0;
-    // fs is measured from the real timestamps on every call (never assumed).
-    if (!resampleUniform(buffer_, 1, x, fs) || fs < 2.0 * cfg_.highHz + 0.5) {
+    if (!resample(buffer_, [](const Sample& s) { return s.c[0][1]; }, probe, fs) || fs < 2.0 * cfg_.highHz + 0.5) {
         metrics_.valid = false;
         return metrics_;
     }
     metrics_.sampleRate = fs;
-
-    // 2. Pulse synthesis: POS on colour input, otherwise normalised green.
     const bool usePos = cfg_.method == PulseMethod::POS && !scalarInput_;
     metrics_.method = usePos ? PulseMethod::POS : PulseMethod::Green;
-    if (usePos) {
-        std::vector<double> b, r;
-        double fsB = 0.0, fsR = 0.0;
-        resampleUniform(buffer_, 0, b, fsB);
-        resampleUniform(buffer_, 2, r, fsR);
-        x = pos(b, x, r, static_cast<int>(std::lround(cfg_.posWindowSec * fs)));
-    } else {
-        const double mean = std::accumulate(x.begin(), x.end(), 0.0) / static_cast<double>(n);
-        if (mean > 1e-6)
-            for (double& v : x) v = v / mean - 1.0;
+    const int dw = static_cast<int>(std::lround(cfg_.detrendWindowSec * fs));
+    const double morphHi = std::min(cfg_.morphHighHz, 0.45 * fs);
+
+    // 2. Per-region pulse, quality and band-limited versions.
+    std::array<std::vector<double>, kRoiCount> narrow, wide;
+    std::array<double, kRoiCount> sqi{}, w{};
+    int bestUsable = -1;
+    for (int k = 0; k < kRoiCount; ++k) {
+        std::size_t ok = 0;
+        double skin = 0.0;
+        for (std::size_t i = 0; i < n; ++i) {
+            if (buffer_[i].ok[k]) { ++ok; skin += buffer_[i].skin[k]; }
+        }
+        const bool usable = ok >= static_cast<std::size_t>(cfg_.minRoiValidFraction * static_cast<double>(n)) &&
+                            ok > 0 && skin / static_cast<double>(ok) >= cfg_.minSkinFraction;
+        if (!usable) continue;
+        std::vector<double> raw = regionPulse(k, fs);
+        detrend(raw, dw);
+        wide[k] = raw;
+        bandpass(wide[k], fs, cfg_.morphLowHz, morphHi, 2);
+        narrow[k] = std::move(raw);
+        bandpass(narrow[k], fs, cfg_.lowHz, cfg_.highHz, cfg_.filterOrderSections);
+        Spectrum sp;
+        sqi[k] = spectrum(narrow[k], fs, cfg_.lowHz, cfg_.highHz, cfg_.confLobeHz, cfg_.dftMinSize, sp) ? sqiOf(sp) : 0.0;
+        if (bestUsable < 0 || sqi[k] > sqi[bestUsable]) bestUsable = k;
     }
-    // Zero-mean moving-average detrend (removes residual baseline before the band-pass).
-    detrend(x, static_cast<int>(std::lround(cfg_.detrendWindowSec * fs)));
+    metrics_.roiSqi = sqi;
+    if (bestUsable < 0) {
+        metrics_.valid = false;
+        metrics_.confidence = 0.0;
+        metrics_.sqi = 0.0;
+        metrics_.roiWeight.fill(0.0);
+        return metrics_;
+    }
 
-    // 3. Zero-phase Butterworth band-pass.
-    bandpass(x, fs, cfg_.lowHz, cfg_.highHz, cfg_.filterOrderSections);
+    // 3. SQI-weighted fusion. A weak region is discarded only when a better region passes
+    //    the minimum SQI; if all regions are weak, all are averaged (√N noise reduction).
+    //    Non-skin / untracked regions were already excluded above.
+    // "Clearly good" = at least twice the minimum; below that SQI differences are mostly
+    // estimation noise, so no region is singled out.
+    const bool anyGood = sqi[bestUsable] >= 2.0 * cfg_.minRoiSqi;
+    double wsum = 0.0;
+    for (int k = 0; k < kRoiCount; ++k) {
+        // Discard only regions that are both below the minimum and much worse than the best
+        // (comparable regions are averaged, the SQI² weights still favour the better one).
+        if (narrow[k].empty() || (anyGood && sqi[k] < cfg_.minRoiSqi && sqi[k] < 0.5 * sqi[bestUsable])) continue;
+        const double q = std::max(sqi[k], 0.12);  // floor flattens weights in the weak regime
+        w[k] = q * q;
+        wsum += w[k];
+    }
+    for (double& v : w) v /= wsum;
+    metrics_.roiWeight = w;
 
-    // 4–5. Spectrum → HR, peaks → IBI / RMSSD.
+    std::vector<double> x(n, 0.0), morph(n, 0.0);
+    for (int k = 0; k < kRoiCount; ++k) {
+        if (w[k] <= 0.0) continue;
+        normalise(narrow[k]);
+        normalise(wide[k]);
+        for (std::size_t i = 0; i < n; ++i) {
+            x[i] += w[k] * narrow[k][i];
+            morph[i] += w[k] * wide[k][i];
+        }
+    }
+
+    // 4. Heart rate from the fused spectrum (true local maxima + tracking prior).
     std::vector<double> peaks;
+    double peakHz = 0.0;
     if (span >= cfg_.minSeconds) {
         Spectrum sp;
         const double prevHz = smoothedBpm_ > 0.0 ? smoothedBpm_ / 60.0 : 0.0;
         if (spectrum(x, fs, cfg_.lowHz, cfg_.highHz, cfg_.confLobeHz, cfg_.dftMinSize, sp, 0.0, 0.0,
                      prevHz, cfg_.trackSigmaBpm / 60.0, cfg_.trackFloor)) {
-            double peakHz = sp.peakHz;
-            // Re-acquisition: the tracking prior suppresses transient jumps, but if the
-            // strongest peak (no prior) keeps disagreeing for reacquireSec, the tracker is
-            // locked on the wrong peak (e.g. a harmonic) — re-lock onto the strongest one.
+            peakHz = sp.peakHz;
             const double tNow = buffer_.back().t;
             if (std::abs(sp.rawPeakHz - peakHz) * 60.0 > cfg_.trackSigmaBpm) {
                 if (disagreeSince_ < 0.0) disagreeSince_ = tNow;
@@ -603,28 +846,54 @@ const SignalMetrics& SignalProcessor::process() {
             }
             metrics_.instantBpm = peakHz * 60.0;
             metrics_.snrDb = sp.snrDb;
-            // Confidence = (peak power / total band power) · normalisation, hard-clamped to [0, 1].
             metrics_.confidence = std::clamp(sp.ratio * cfg_.confNorm, 0.0, 1.0);
-
+            metrics_.sqi = sqiOf(sp);
             const double a = std::clamp(cfg_.bpmSmoothing * (0.3 + 0.7 * metrics_.confidence), 0.02, 1.0);
             smoothedBpm_ = smoothedBpm_ <= 0.0 ? metrics_.instantBpm
                                                 : smoothedBpm_ + a * (metrics_.instantBpm - smoothedBpm_);
             metrics_.bpm = smoothedBpm_;
             metrics_.valid = true;
-            computeHrv(x, fs, peakHz, peaks);
+            // Beat timing on a band centred on the fundamental only (f0 ± 0.5 Hz): the 0.75–2.5 Hz
+            // signal also holds the 2nd harmonic, i.e. a second (diastolic) peak per cycle that
+            // noise can make the detector pick — a half-cycle timing error. ±0.5 Hz keeps the
+            // HRV side-bands (≤ 0.4 Hz) and always excludes 2·f0 for HR ≥ 45 BPM.
+            std::vector<double> xb = morph;
+            bandpass(xb, fs, std::max(0.5, peakHz - 0.5), peakHz + 0.5, 2);
+            computeHrv(xb, fs, peakHz, peaks);
+            if (metrics_.confidence >= cfg_.minBeatConfidence && metrics_.sqi >= cfg_.minBeatSqi)
+                emitBeats(peaks, fs);
         } else {
-            // No genuine spectral peak in the band (only edge leakage / flat noise):
-            // report "no estimate" instead of freezing the previous number on screen.
             metrics_.valid = false;
             metrics_.confidence = 0.0;
+            metrics_.sqi = 0.0;
         }
     } else {
         metrics_.valid = false;
+        metrics_.sqi = 0.0;
     }
 
+    // 5. Side products.
+    metrics_.morphWave = morph;
+    if (metrics_.valid) {
+        processRatio(w, peakHz);
+        std::vector<double> faceG;
+        double f = 0.0;
+        const int k = bestUsable;
+        resample(buffer_, [k](const Sample& s) { return s.c[k][1]; }, faceG, f);
+        const double mg = std::accumulate(faceG.begin(), faceG.end(), 0.0) / static_cast<double>(n);
+        if (mg > 1e-6)
+            for (double& v : faceG) v = v / mg - 1.0;
+        detrend(faceG, dw);
+        bandpass(faceG, fs, cfg_.lowHz, cfg_.highHz, cfg_.filterOrderSections);
+        processBackground(peakHz, faceG, fs);
+    } else {
+        metrics_.ratioValid = false;
+        metrics_.backgroundChecked = false;
+        metrics_.ambientSuspect = false;
+    }
     processRespiration();
 
-    // Export the most recent part of the filtered waveform for display.
+    // Export the most recent part of the fused narrow-band waveform for display.
     const std::size_t wn = std::min(n, static_cast<std::size_t>(cfg_.waveformSeconds * fs));
     const std::size_t start = n - wn;
     double amp = 1e-12;

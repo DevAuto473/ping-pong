@@ -100,6 +100,8 @@ void FaceTracker::reset() {
     lmInitialised_ = false;
     iodState_ = 0.f;
     hairState_ = 0.f;
+    pitchRef_ = -1.f;
+    prevPoseT_ = -1.0;
     missed_ = 0;
     prevCenter_ = {-1.f, -1.f};
     last_ = FaceObservation{};
@@ -249,7 +251,46 @@ void FaceTracker::computeRois(const cv::Mat& frame, const cv::Size& frameSize) {
     last_.rollDeg = roll * 180.f / kPi;
 }
 
-FaceObservation FaceTracker::update(const cv::Mat& bgr) {
+void FaceTracker::computePose(double t) {
+    cv::Point2f eL = lmState_[0], eR = lmState_[1];
+    if (eL.x > eR.x) std::swap(eL, eR);
+    const cv::Point2f axis = eR - eL;
+    const float iod = std::max(1.f, norm2(axis));
+    const cv::Point2f u = axis * (1.f / iod);
+    const cv::Point2f down(-u.y, u.x);  // perpendicular, pointing towards the mouth
+    const cv::Point2f mid = 0.5f * (eL + eR);
+    const cv::Point2f mouth = 0.5f * (lmState_[3] + lmState_[4]);
+    const cv::Point2f nose = lmState_[2];
+
+    // Yaw: the nose tip sits ≈ 0.55·IOD in front of the eye plane, so its lateral
+    // offset along the eye axis is ≈ 0.55·IOD·sin(yaw).
+    const float lateral = (nose - mid).dot(u) / iod;
+    const float yaw = std::asin(std::clamp(lateral / 0.55f, -1.f, 1.f)) * 180.f / kPi;
+    // Pitch: nose height relative to the eye→mouth distance changes with pitch; the
+    // neutral ratio is learnt slowly per subject (relative, not absolute, pitch).
+    const float dm = std::max(1.f, (mouth - mid).dot(down));
+    const float ratio = (nose - mid).dot(down) / dm;
+    pitchRef_ = pitchRef_ < 0.f ? ratio : pitchRef_ + 0.01f * (ratio - pitchRef_);
+    const float pitch = std::asin(std::clamp((ratio - pitchRef_) / 0.5f, -1.f, 1.f)) * 180.f / kPi;
+    const float roll = last_.rollDeg;
+
+    if (t >= 0.0 && prevPoseT_ >= 0.0 && t > prevPoseT_ && t - prevPoseT_ < 0.5) {
+        const float dt = static_cast<float>(t - prevPoseT_);
+        const float speed = std::max({std::abs(yaw - prevYaw_), std::abs(pitch - prevPitch_),
+                                      std::abs(roll - prevRoll_)}) / dt;
+        last_.angularSpeedDps += 0.5f * (speed - last_.angularSpeedDps);
+    } else {
+        last_.angularSpeedDps = 0.f;
+    }
+    if (t >= 0.0) prevPoseT_ = t;
+    prevYaw_ = yaw;
+    prevPitch_ = pitch;
+    prevRoll_ = roll;
+    last_.yawDeg = yaw;
+    last_.pitchDeg = pitch;
+}
+
+FaceObservation FaceTracker::update(const cv::Mat& bgr, double t) {
     if (bgr.empty()) {
         reset();
         return last_;
@@ -257,18 +298,18 @@ FaceObservation FaceTracker::update(const cv::Mat& bgr) {
     if (detector_.empty()) throw std::logic_error("FaceTracker::update called without a model; use ingest()");
     RawFace raw;
     const bool found = detect(bgr, raw);
-    return integrate(found, raw, bgr, bgr.size());
+    return integrate(found, raw, bgr, bgr.size(), t);
 }
 
 FaceObservation FaceTracker::ingest(const cv::Mat& faces, const cv::Mat& bgrFrame,
-                                    const cv::Size& frameSize) {
+                                    const cv::Size& frameSize, double t) {
     RawFace raw;
     const bool found = selectFace(faces, 1.f, raw);
-    return integrate(found, raw, bgrFrame, frameSize);
+    return integrate(found, raw, bgrFrame, frameSize, t);
 }
 
 FaceObservation FaceTracker::integrate(bool found, const RawFace& raw, const cv::Mat& frame,
-                                       const cv::Size& frameSize) {
+                                       const cv::Size& frameSize, double t) {
     if (!found) {
         ++missed_;
         if (last_.valid && missed_ <= cfg_.maxMissedFrames) {
@@ -306,6 +347,14 @@ FaceObservation FaceTracker::integrate(bool found, const RawFace& raw, const cv:
     last_.landmarks = lmState_;
     last_.motion = motion;
     computeRois(frame, frameSize);
+    computePose(t);
+
+    // Background reference patches beside the head (outside the face box, eye height).
+    const float fw = face.width, fh = face.height;
+    const cv::Rect2f bl(face.x - 0.75f * fw, face.y + 0.1f * fh, 0.5f * fw, 0.6f * fh);
+    const cv::Rect2f br(face.x + 1.25f * fw, face.y + 0.1f * fh, 0.5f * fw, 0.6f * fh);
+    last_.backgroundLeft = clipRect(bl, frameSize);
+    last_.backgroundRight = clipRect(br, frameSize);
 
     // Reject degenerate geometry (face partially outside the frame, etc.).
     if (last_.forehead.area() < 64 || last_.leftEye.area() < 36 || last_.rightEye.area() < 36) {

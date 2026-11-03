@@ -64,6 +64,15 @@ struct FaceObservation {
     float interOcular = 0.f;        ///< Pixels, stabilised.
     float rollDeg = 0.f;
     float motion = 0.f;             ///< Normalised per-frame face displacement (×inter-ocular).
+    /// Approximate head pose from the 5 landmarks (degrees). Yaw from the nose offset along
+    /// the eye axis, pitch relative to the session's own neutral nose/mouth geometry.
+    float yawDeg = 0.f;
+    float pitchDeg = 0.f;
+    /// Max angular speed over yaw / pitch / roll (deg/s, smoothed); 0 without timestamps.
+    float angularSpeedDps = 0.f;
+    /// Non-face patches beside the head (ambient-light / screen-flicker reference).
+    cv::Rect backgroundLeft;
+    cv::Rect backgroundRight;
 };
 
 class FaceTracker {
@@ -72,12 +81,14 @@ public:
     explicit FaceTracker(const FaceTrackerConfig& cfg);
 
     /// Runs detection on a BGR frame and returns the stabilised observation.
-    FaceObservation update(const cv::Mat& bgrFrame);
+    /// `t` (seconds) enables head-pose velocity; pass < 0 if unknown.
+    FaceObservation update(const cv::Mat& bgrFrame, double t = -1.0);
 
     /// Feeds externally computed detections in YuNet layout (N×15 CV_32F, frame
     /// coordinates) through the same selection / stabilisation / ROI pipeline.
     /// `bgrFrame` may be empty (hairline then falls back to the geometric prior).
-    FaceObservation ingest(const cv::Mat& yunetFaces, const cv::Mat& bgrFrame, const cv::Size& frameSize);
+    FaceObservation ingest(const cv::Mat& yunetFaces, const cv::Mat& bgrFrame, const cv::Size& frameSize,
+                           double t = -1.0);
 
     void reset();
     const FaceObservation& last() const { return last_; }
@@ -92,7 +103,8 @@ private:
     bool detect(const cv::Mat& bgr, RawFace& out);
     bool selectFace(const cv::Mat& faces, float invScale, RawFace& out) const;
     FaceObservation integrate(bool found, const RawFace& raw, const cv::Mat& frame,
-                              const cv::Size& frameSize);
+                              const cv::Size& frameSize, double t);
+    void computePose(double t);
     float estimateHairline(const cv::Mat& bgr, const cv::Point2f& eyeMid, float iod);
     void computeRois(const cv::Mat& frame, const cv::Size& frameSize);
 
@@ -105,7 +117,10 @@ private:
     std::array<cv::Point2f, 5> lmState_{};
     bool lmInitialised_ = false;
     float iodState_ = 0.f;
-    float hairState_ = 0.f;   ///< Smoothed eye-line → hairline distance (px).
+    float hairState_ = 0.f;
+    float pitchRef_ = -1.f;   ///< Neutral nose/mouth ratio (slow EMA).
+    float prevYaw_ = 0.f, prevPitch_ = 0.f, prevRoll_ = 0.f;
+    double prevPoseT_ = -1.0;   ///< Smoothed eye-line → hairline distance (px).
 
     int missed_ = 0;
     cv::Point2f prevCenter_{-1.f, -1.f};

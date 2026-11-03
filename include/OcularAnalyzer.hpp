@@ -41,7 +41,9 @@ struct OcularConfig {
     double warmupSec = 2.0;          ///< Time before metrics become valid.
     double blinkRatio = 0.75;        ///< Closure starts below this fraction of mean EAR.
     double recoverRatio = 0.85;      ///< … and ends above this one (hysteresis).
-    double completeRatio = 0.45;     ///< Minimum EAR below this → complete blink.
+    double completeRatio = 0.62;     ///< Minimum EAR / mean below this → complete blink.
+                                     ///< Tuned on real webcam data: the lash line keeps the
+                                     ///< aperture proxy at ≈ 0.45–0.6 of open even when shut.
     double closedRatio = 0.35;       ///< PERCLOS: frame counts as closed below this ratio.
 
     int minBlinkFrames = 2;          ///< Blink duration limits, in frames at `referenceFps`.
@@ -69,6 +71,8 @@ struct OcularMetrics {
     double lastBlinkDurationMs = 0.0;
     double lastBlinkMinRatio = 0.0; ///< Deepest EAR / mean of the last blink (diagnostic for tuning).
     long framesProcessed = 0;   ///< Frames that actually reached the analyzer (diagnostics).
+    double sessionTrackedSec = 0.0; ///< Whole-session tracked time (session PERCLOS / blink rate).
+    double sessionClosedSec = 0.0;
 };
 
 class OcularAnalyzer {

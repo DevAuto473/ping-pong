@@ -207,6 +207,8 @@ const OcularMetrics& OcularAnalyzer::update(const cv::Mat& gray, const cv::Rect&
     frames_.push_back({t, dt, closed});
     trackedSec_ += dt;
     if (closed) closedSec_ += dt;
+    metrics_.sessionTrackedSec += dt;
+    if (closed) metrics_.sessionClosedSec += dt;
     metrics_.perclos = trackedSec_ > 0.0 ? std::clamp(closedSec_ / trackedSec_, 0.0, 1.0) : 0.0;
 
     // Blink rate over the tracked part of the last 60 s (≥ 10 s avoids start-up spikes).

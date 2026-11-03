@@ -34,7 +34,8 @@ void testHeartRate(double bpm, double fpsNominal) {
         t += 1.0 / fpsNominal + jitter(rng);
         double pulse = 0.0;
         for (double b : beats) pulse += std::exp(-(t - b) * (t - b) / (2 * 0.07 * 0.07));
-        const double v = 120.0 + 0.8 * pulse + 3.0 * std::sin(2 * kPi * 0.04 * t) + noise(rng);
+        // Skin reflectance *falls* during systole (more blood absorbs more light).
+        const double v = 120.0 - 0.8 * pulse + 3.0 * std::sin(2 * kPi * 0.04 * t) + noise(rng);
         sp.push(v, t);
         sp.process();
     }
@@ -302,7 +303,7 @@ double runWebcam(const WebcamSim& sim, vitals::PulseMethod method, double fpsNom
         const double illum = (1.0 + sim.illumAmp * std::sin(2 * kPi * sim.illumHz * t) +
                               sim.driftAmp * std::sin(2 * kPi * 0.6 * t)) * exposure;
         cv::Vec3d c;
-        for (int k = 0; k < 3; ++k) c[k] = dc[k] * (1.0 + a * pv[k] * pulse) * illum + noise(rng);
+        for (int k = 0; k < 3; ++k) c[k] = dc[k] * (1.0 - a * pv[k] * pulse) * illum + noise(rng);  // reflectance falls in systole
         sp.push(c, t);
         sp.process();
     }
