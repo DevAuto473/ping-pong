@@ -80,8 +80,10 @@ void TelemetryUI::drawRois(cv::Mat& frame, const FaceObservation& f) const {
     cornerBox(frame, cv::Rect(f.face) & cv::Rect(0, 0, frame.cols, frame.rows), faceCol,
               static_cast<int>(22 * s), th + 1);
 
-    blendRect(frame, f.forehead, kPulse, 0.16);
-    cv::rectangle(frame, f.forehead, kPulse, 1, cv::LINE_AA);
+    for (const cv::Rect& r : {f.forehead, f.leftCheek, f.rightCheek}) {
+        blendRect(frame, r, kPulse, 0.16);
+        cv::rectangle(frame, r, kPulse, 1, cv::LINE_AA);
+    }
     text(frame, "rPPG", f.forehead.tl() + cv::Point(3, -5), 0.4 * s + 0.1, kPulse, 1);
 
     for (const cv::Rect& e : {f.leftEye, f.rightEye}) {
@@ -281,7 +283,8 @@ void TelemetryUI::drawWaveform(cv::Mat& frame, const cv::Rect& area, const Signa
 
     const cv::Rect plot(area.x + (int)(10 * s), area.y + (int)(26 * s), area.width - (int)(20 * s),
                         area.height - (int)(36 * s));
-    text(frame, "PULSE WAVEFORM  (BANDPASS 0.75-2.5 Hz)", {area.x + (int)(12 * s), area.y + (int)(18 * s)},
+    text(frame, std::string("PULSE WAVEFORM  (") + (m.method == PulseMethod::POS ? "POS" : "GREEN") +
+                    ", BANDPASS 0.75-2.5 Hz)", {area.x + (int)(12 * s), area.y + (int)(18 * s)},
          0.42 * s, kMuted, 1);
     if (m.sampleRate > 0.0) {
         const std::string fsTxt = fmt("fs %.1f Hz", m.sampleRate) + fmt("   SNR %.1f dB", m.snrDb);

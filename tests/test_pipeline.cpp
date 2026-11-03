@@ -269,6 +269,97 @@ void testOcularPauseGap() {
     EXPECT(m.framesProcessed == before + 90, "frame counting after pause");
     EXPECT(m.totalBlinks == 0 && m.longClosures == 0, "a tracking gap must not create blink events");
 }
+
+/// Webcam-like colour signal: weak pulse (0.3 %) along the skin pulse vector, buried under a
+/// stronger *common-mode* illumination flicker at 60 BPM, auto-exposure steps and a large
+/// drift just below the band (0.6 Hz), sampled at a jittery ~19.9 FPS with dropped frames.
+struct WebcamSim {
+    double trueBpm;
+    double illumHz = 1.0;      // 60 BPM illumination flicker (in band!)
+    double illumAmp = 0.02;    // 2 % — ~9× the green pulse amplitude
+    double driftAmp = 0.03;    // 3 % baseline swing at 0.6 Hz (below the band)
+    bool aeSteps = true;       // ±1.5 % auto-exposure square wave (period 7 s)
+};
+
+double runWebcam(const WebcamSim& sim, vitals::PulseMethod method, double fpsNominal,
+                 double* conf = nullptr, int seconds = 30) {
+    vitals::SignalConfig cfg;
+    cfg.method = method;
+    vitals::SignalProcessor sp(cfg);
+    std::mt19937 rng(17);
+    std::normal_distribution<double> jitter(0.0, 0.006), noise(0.0, 0.25);
+    std::uniform_real_distribution<double> u(0.0, 1.0);
+    const double dc[3] = {110.0, 130.0, 180.0};          // B, G, R skin tone
+    const double pv[3] = {0.53, 0.77, 0.33};             // pulse vector (B, G, R), de Haan 2013
+    const double a = 0.003;
+    double t = 0.0;
+    while (t < seconds) {
+        t += 1.0 / fpsNominal + jitter(rng);
+        if (u(rng) < 0.05) continue;                     // dropped frame
+        const double ph = 2 * kPi * sim.trueBpm / 60.0 * t;
+        const double pulse = std::sin(ph) + 0.4 * std::sin(2 * ph + 0.5);
+        const double exposure = 1.0 + (sim.aeSteps && std::fmod(t, 7.0) >= 3.5 ? 0.03 : 0.0);  // AE steps
+        const double illum = (1.0 + sim.illumAmp * std::sin(2 * kPi * sim.illumHz * t) +
+                              sim.driftAmp * std::sin(2 * kPi * 0.6 * t)) * exposure;
+        cv::Vec3d c;
+        for (int k = 0; k < 3; ++k) c[k] = dc[k] * (1.0 + a * pv[k] * pulse) * illum + noise(rng);
+        sp.push(c, t);
+        sp.process();
+    }
+    if (conf) *conf = sp.metrics().confidence;
+    return sp.metrics().valid ? sp.metrics().bpm : 0.0;
+}
+
+void testPosVsIllumination() {
+    for (double bpm : {58.0, 84.0, 110.0}) {
+        WebcamSim sim{bpm};
+        double cPos = 0, cGreen = 0;
+        const double pos = runWebcam(sim, vitals::PulseMethod::POS, 19.9, &cPos);
+        const double green = runWebcam(sim, vitals::PulseMethod::Green, 19.9, &cGreen);
+        std::printf("  true %5.1f bpm @ ~19.9 fps (flicker 60 bpm, AE steps, drift): POS %5.1f (conf %3.0f%%)"
+                    "   green %5.1f (conf %3.0f%%)\n", bpm, pos, cPos * 100, green, cGreen * 100);
+        EXPECT(std::abs(pos - bpm) < 3.0, "POS %.1f vs %.1f", pos, bpm);
+        EXPECT(pos > 47.0, "POS latched at the lower band edge (%.1f)", pos);
+    }
+    // The case motivating POS: green-only follows the 60 BPM illumination flicker.
+    WebcamSim sim{84.0};
+    const double green = runWebcam(sim, vitals::PulseMethod::Green, 19.9);
+    EXPECT(std::abs(green - 84.0) > 5.0, "expected green-only to fail here (%.1f) - test is not discriminative", green);
+}
+
+void testVariableFps() {
+    for (double fps : {15.0, 19.9, 24.0, 30.0}) {
+        WebcamSim sim{76.0, 1.0, 0.0, 0.0, false};
+        const double pos = runWebcam(sim, vitals::PulseMethod::POS, fps);
+        std::printf("  76 bpm @ %4.1f fps -> %.1f bpm\n", fps, pos);
+        EXPECT(std::abs(pos - 76.0) < 2.0, "fps %.1f: %.1f bpm", fps, pos);
+    }
+}
+
+void testNoEdgeLatch() {
+    // Huge baseline power just below the band (0.6 Hz, 10 %) must not drag the estimate to 45 BPM.
+    WebcamSim sim{92.0, 1.0, 0.0, 0.10, false};
+    const double green = runWebcam(sim, vitals::PulseMethod::Green, 30.0);
+    std::printf("  strong 0.6 Hz baseline, pulse 92 bpm -> green %.1f bpm\n", green);
+    EXPECT(std::abs(green - 92.0) < 3.0, "latched: %.1f", green);
+}
+
+void testTransientRejection() {
+    // Steady 70 BPM; a 2 s burst of strong 105 BPM interference must not yank the reading.
+    vitals::SignalProcessor sp;
+    std::mt19937 rng(23);
+    std::normal_distribution<double> noise(0.0, 0.1);
+    double t = 0.0, worst = 0.0;
+    for (int i = 0; i < 30 * 40; ++i, t += 1.0 / 30) {
+        double v = 120.0 + 0.6 * std::sin(2 * kPi * (70.0 / 60.0) * t) + noise(rng);
+        if (t > 25.0 && t < 27.0) v += 1.5 * std::sin(2 * kPi * 1.75 * t);
+        sp.push(v, t);
+        const auto& m = sp.process();
+        if (t > 15.0 && m.valid) worst = std::max(worst, std::abs(m.bpm - 70.0));
+    }
+    std::printf("  2 s interference burst: max deviation of reported HR %.1f bpm\n", worst);
+    EXPECT(worst < 6.0, "reported HR jumped by %.1f bpm", worst);
+}
 }  // namespace
 
 int main() {
@@ -278,6 +369,11 @@ int main() {
     testHeartRate(95, 25);
     testHeartRate(130, 30);
     testPauseResume();
+    std::printf("[POS / webcam conditions]\n");
+    testPosVsIllumination();
+    testVariableFps();
+    testNoEdgeLatch();
+    testTransientRejection();
     std::printf("[Confidence]\n");
     testConfidence();
     std::printf("[Respiration]\n");

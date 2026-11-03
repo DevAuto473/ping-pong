@@ -63,7 +63,9 @@ FaceTracker::FaceTracker(const FaceTrackerConfig& cfg)
       faceEma_(cfg.roiAlpha),
       foreheadEma_(cfg.roiAlpha),
       leftEyeEma_(cfg.roiAlpha),
-      rightEyeEma_(cfg.roiAlpha) {
+      rightEyeEma_(cfg.roiAlpha),
+      leftCheekEma_(cfg.roiAlpha),
+      rightCheekEma_(cfg.roiAlpha) {
     if (cfg_.modelPath.empty()) return;  // ingest-only mode (external detector / tests)
     {
         std::ifstream f(cfg_.modelPath, std::ios::binary);
@@ -93,6 +95,8 @@ void FaceTracker::reset() {
     foreheadEma_.reset();
     leftEyeEma_.reset();
     rightEyeEma_.reset();
+    leftCheekEma_.reset();
+    rightCheekEma_.reset();
     lmInitialised_ = false;
     iodState_ = 0.f;
     hairState_ = 0.f;
@@ -230,6 +234,17 @@ void FaceTracker::computeRois(const cv::Mat& frame, const cv::Size& frameSize) {
     last_.forehead = clipRect(foreheadEma_.update(fhMeasure), frameSize);
     last_.leftEye = clipRect(leftEyeEma_.update(lMeasure), frameSize);
     last_.rightEye = clipRect(rightEyeEma_.update(rMeasure), frameSize);
+
+    // --- Cheeks ---------------------------------------------------------------
+    // Centred 0.62·IOD below each eye and shifted 0.06·IOD outward (away from the
+    // nose); 0.38 × 0.30 IOD keeps them clear of the lower eyelid, nose and mouth.
+    const cv::Point2f down = -up;
+    const cv::Point2f outward = axis * (1.f / std::max(1.f, norm2(axis)));
+    const float cw = 0.38f * d, ch = 0.30f * d;
+    const cv::Rect2f lcMeasure = centeredRect(eL + down * (0.62f * d) - outward * (0.06f * d), cw, ch);
+    const cv::Rect2f rcMeasure = centeredRect(eR + down * (0.62f * d) + outward * (0.06f * d), cw, ch);
+    last_.leftCheek = clipRect(leftCheekEma_.update(lcMeasure), frameSize);
+    last_.rightCheek = clipRect(rightCheekEma_.update(rcMeasure), frameSize);
     last_.interOcular = d;
     last_.rollDeg = roll * 180.f / kPi;
 }

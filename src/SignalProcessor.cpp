@@ -1,6 +1,7 @@
 #include "SignalProcessor.hpp"
 
 #include <opencv2/core.hpp>
+#include <opencv2/imgproc.hpp>
 
 #include <algorithm>
 #include <cmath>
@@ -72,7 +73,7 @@ SignalProcessor::SignalProcessor(const SignalConfig& cfg)
     : cfg_(cfg),
       buffer_(std::max<std::size_t>(cfg.bufferSize, 64)),
       respBuffer_(std::max<std::size_t>(cfg.respBufferSize, cfg.bufferSize)) {
-    cfg_.minSamples = std::min(std::max<std::size_t>(cfg_.minSamples, 64), buffer_.capacity());
+    cfg_.minSeconds = std::max(cfg_.minSeconds, 3.0);
 }
 
 void SignalProcessor::reset() {
@@ -82,10 +83,12 @@ void SignalProcessor::reset() {
     respHistory_.clear();
     metrics_ = SignalMetrics{};
     paused_ = false;
-    timeOffset_ = levelOffset_ = 0.0;
-    lastRaw_ = 0.0;
+    timeOffset_ = 0.0;
+    levelOffset_ = lastRaw_ = cv::Vec3d(0, 0, 0);
+    scalarInput_ = false;
     lastT_ = -1.0;
     smoothedBpm_ = 0.0;
+    disagreeSince_ = -1.0;
 }
 
 void SignalProcessor::pause(double t) {
@@ -97,7 +100,39 @@ void SignalProcessor::pause(double t) {
 }
 
 void SignalProcessor::push(double value, double t) {
-    if (!std::isfinite(value) || !std::isfinite(t)) return;
+    push(cv::Vec3d(value, value, value), t);
+    scalarInput_ = true;
+}
+
+bool SignalProcessor::skinMean(const cv::Mat& bgr, const std::vector<cv::Rect>& rois, cv::Vec3d& out) {
+    cv::Vec3d sumMasked(0, 0, 0), sumAll(0, 0, 0);
+    double nMasked = 0.0, nAll = 0.0;
+    cv::Mat ycc, mask;
+    for (const cv::Rect& r0 : rois) {
+        const cv::Rect r = r0 & cv::Rect(0, 0, bgr.cols, bgr.rows);
+        if (r.area() <= 0) continue;
+        const cv::Mat roi = bgr(r);
+        cv::cvtColor(roi, ycc, cv::COLOR_BGR2YCrCb);
+        // Broad skin chroma gate (covers light to dark skin), excluding shadows (Y < 40)
+        // and clipped highlights (Y > 240) whose pulsatile modulation is lost.
+        cv::inRange(ycc, cv::Scalar(40, 133, 77), cv::Scalar(240, 180, 130), mask);
+        const double nm = cv::countNonZero(mask);
+        const cv::Scalar mAll = cv::mean(roi);
+        sumAll += cv::Vec3d(mAll[0], mAll[1], mAll[2]) * static_cast<double>(r.area());
+        nAll += r.area();
+        if (nm > 0) {
+            const cv::Scalar mm = cv::mean(roi, mask);
+            sumMasked += cv::Vec3d(mm[0], mm[1], mm[2]) * nm;
+            nMasked += nm;
+        }
+    }
+    if (nAll <= 0.0) return false;
+    out = nMasked >= 0.25 * nAll ? sumMasked / nMasked : sumAll / nAll;
+    return true;
+}
+
+void SignalProcessor::push(const cv::Vec3d& bgr, double t) {
+    if (!std::isfinite(bgr[0]) || !std::isfinite(bgr[1]) || !std::isfinite(bgr[2]) || !std::isfinite(t)) return;
 
     if (paused_) {
         paused_ = false;
@@ -113,21 +148,21 @@ void SignalProcessor::push(double value, double t) {
                 dt = (buffer_.back().t - buffer_[0].t) / static_cast<double>(buffer_.size() - 1);
             }
             timeOffset_ = t - (buffer_.back().t + dt);
-            levelOffset_ += lastRaw_ - value;
+            levelOffset_ += lastRaw_ - bgr;
         }
     }
 
     const double te = t - timeOffset_;
     if (!buffer_.empty() && te <= buffer_.back().t) return;  // non-monotonic clock
-    buffer_.push({value + levelOffset_, te});
-    respBuffer_.push({value + levelOffset_, te});
-    lastRaw_ = value;
+    buffer_.push({bgr + levelOffset_, te});
+    respBuffer_.push({bgr + levelOffset_, te});
+    lastRaw_ = bgr;
     lastT_ = t;
     metrics_.paused = false;
 }
 
-bool SignalProcessor::resampleUniform(const CircularBuffer<Sample>& buffer_, std::vector<double>& out,
-                                      double& fs) {
+bool SignalProcessor::resampleUniform(const CircularBuffer<Sample>& buffer_, int ch,
+                                      std::vector<double>& out, double& fs) {
     const std::size_t n = buffer_.size();
     if (n < 2) return false;
     const double t0 = buffer_[0].t, t1 = buffer_.back().t;
@@ -144,9 +179,43 @@ bool SignalProcessor::resampleUniform(const CircularBuffer<Sample>& buffer_, std
         const Sample& b = buffer_[std::min(j + 1, n - 1)];
         const double dt = b.t - a.t;
         const double u = dt > 0.0 ? std::clamp((t - a.t) / dt, 0.0, 1.0) : 0.0;
-        out[i] = a.v + u * (b.v - a.v);
+        out[i] = a.c[ch] + u * (b.c[ch] - a.c[ch]);
     }
     return true;
+}
+
+std::vector<double> SignalProcessor::pos(const std::vector<double>& b, const std::vector<double>& g,
+                                         const std::vector<double>& r, int window) {
+    const int n = static_cast<int>(g.size());
+    std::vector<double> h(static_cast<std::size_t>(n), 0.0);
+    const int l = std::clamp(window, 4, n);
+    std::vector<double> s1(static_cast<std::size_t>(l)), s2(static_cast<std::size_t>(l));
+    for (int start = 0; start + l <= n; ++start) {
+        // Temporal normalisation: divide each channel by its mean over the window.
+        double mb = 0, mg = 0, mr = 0;
+        for (int i = start; i < start + l; ++i) { mb += b[i]; mg += g[i]; mr += r[i]; }
+        mb /= l; mg /= l; mr /= l;
+        if (mb <= 1e-6 || mg <= 1e-6 || mr <= 1e-6) continue;
+        // Projection onto the plane orthogonal to the skin tone:
+        //   S1 = Gn − Bn,  S2 = Gn + Bn − 2·Rn   (P = [[0, 1, −1], [−2, 1, 1]] on [R, G, B])
+        double m1 = 0, m2 = 0;
+        for (int i = 0; i < l; ++i) {
+            const double rn = r[start + i] / mr, gn = g[start + i] / mg, bn = b[start + i] / mb;
+            s1[i] = gn - bn;
+            s2[i] = gn + bn - 2.0 * rn;
+            m1 += s1[i]; m2 += s2[i];
+        }
+        m1 /= l; m2 /= l;
+        double v1 = 0, v2 = 0;
+        for (int i = 0; i < l; ++i) { v1 += (s1[i] - m1) * (s1[i] - m1); v2 += (s2[i] - m2) * (s2[i] - m2); }
+        // Alpha tuning: combine the two projections so the residual distortion cancels.
+        const double alpha = v2 > 1e-18 ? std::sqrt(v1 / v2) : 0.0;
+        double mh = 0;
+        for (int i = 0; i < l; ++i) { s1[i] += alpha * s2[i]; mh += s1[i]; }
+        mh /= l;
+        for (int i = 0; i < l; ++i) h[static_cast<std::size_t>(start + i)] += s1[i] - mh;  // overlap-add
+    }
+    return h;
 }
 
 void SignalProcessor::detrend(std::vector<double>& x, int window) {
@@ -214,7 +283,8 @@ void SignalProcessor::bandpass(std::vector<double>& x, double fs, double loHz, d
 }
 
 bool SignalProcessor::spectrum(const std::vector<double>& x, double fs, double lo, double hi,
-                               double lobeHz, int nfftMin, Spectrum& out, double refLo, double refHi) {
+                               double lobeHz, int nfftMin, Spectrum& out, double refLo, double refHi,
+                               double prevHz, double trackSigmaHz, double trackFloor) {
     const int n = static_cast<int>(x.size());
     if (n < 16) return false;
     const int nfft = cv::getOptimalDFTSize(std::max(nfftMin, n));
@@ -237,13 +307,28 @@ bool SignalProcessor::spectrum(const std::vector<double>& x, double fs, double l
     const int kHi = std::min(half - 2, static_cast<int>(std::floor(hi / df)));
     if (kHi <= kLo + 2) return false;
 
-    int kMax = kLo;
-    for (int k = kLo; k <= kHi; ++k)
-        if (p[k] > p[kMax]) kMax = k;
+    // Candidates: true local maxima of the *full* spectrum inside [lo, hi]. A bin at the
+    // lower edge whose left neighbour (outside the band) is larger is leakage from the
+    // baseline, not a pulse peak, and is therefore never selected.
+    int kMax = -1, kRaw = -1;
+    double best = -1.0;
+    for (int k = kLo; k <= kHi; ++k) {
+        if (!(p[k] > p[k - 1] && p[k] >= p[k + 1])) continue;
+        if (kRaw < 0 || p[k] > p[kRaw]) kRaw = k;
+        double w = 1.0;
+        if (prevHz > 0.0 && trackFloor < 1.0) {
+            const double d = (k * df - prevHz) / std::max(1e-6, trackSigmaHz);
+            w = trackFloor + (1.0 - trackFloor) * std::exp(-d * d);
+        }
+        if (p[k] * w > best) { best = p[k] * w; kMax = k; }
+    }
+    out.edgeOnly = kMax < 0;
+    if (kMax < 0) return false;
+    out.rawPeakHz = kRaw * df;
 
     // Parabolic interpolation on the magnitude for sub-bin accuracy.
     double delta = 0.0;
-    if (kMax > kLo && kMax < kHi) {
+    {
         const double a = std::sqrt(p[kMax - 1]), b = std::sqrt(p[kMax]), cc = std::sqrt(p[kMax + 1]);
         const double den = a - 2.0 * b + cc;
         if (std::abs(den) > 1e-18) delta = std::clamp(0.5 * (a - cc) / den, -0.5, 0.5);
@@ -362,7 +447,7 @@ void SignalProcessor::processRespiration() {
 
     std::vector<double> x;
     double fs = 0.0;
-    if (!resampleUniform(respBuffer_, x, fs) || fs < 2.0 * cfg_.respHighHz + 1.0) {
+    if (!resampleUniform(respBuffer_, 1, x, fs) || fs < 2.0 * cfg_.respHighHz + 1.0) {
         metrics_.respValid = false;
         return;
     }
@@ -422,12 +507,16 @@ void SignalProcessor::processRespiration() {
     // Temporal stability: a genuine breathing rhythm does not jump between estimates,
     // whereas the peak of a noise-only spectrum wanders. Require the last ~5 s of FFT
     // estimates to stay within ±1.5 BrPM of their median.
-    respHistory_.push_back(fftBrpm);
-    while (respHistory_.size() > cfg_.respStabilityFrames) respHistory_.pop_front();
-    bool stable = respHistory_.size() >= cfg_.respStabilityFrames;
+    const double tNow = respBuffer_.back().t;
+    respHistory_.emplace_back(tNow, fftBrpm);
+    while (!respHistory_.empty() && tNow - respHistory_.front().first > cfg_.respStabilitySec)
+        respHistory_.pop_front();
+    bool stable = tNow - respHistory_.front().first >= 0.9 * cfg_.respStabilitySec;
     if (stable) {
-        const double med = median(std::vector<double>(respHistory_.begin(), respHistory_.end()));
-        for (double v : respHistory_)
+        std::vector<double> vals;
+        for (const auto& e : respHistory_) vals.push_back(e.second);
+        const double med = median(vals);
+        for (double v : vals)
             if (std::abs(v - med) > 1.5) { stable = false; break; }
     }
 
@@ -447,7 +536,8 @@ const SignalMetrics& SignalProcessor::process() {
     if (paused_) return metrics_;
 
     const std::size_t n = buffer_.size();
-    metrics_.bufferFill = std::min(1.0, static_cast<double>(n) / cfg_.minSamples);
+    const double span = n > 1 ? buffer_.back().t - buffer_[0].t : 0.0;
+    metrics_.bufferFill = std::clamp(span / cfg_.minSeconds, 0.0, 1.0);
     if (n < 32) {
         metrics_.valid = false;
         metrics_.waveform.clear();
@@ -458,16 +548,28 @@ const SignalMetrics& SignalProcessor::process() {
     // 1. Uniform resampling at the measured rate.
     std::vector<double> x;
     double fs = 0.0;
-    if (!resampleUniform(buffer_, x, fs) || fs < 2.0 * cfg_.highHz + 0.5) {
+    // fs is measured from the real timestamps on every call (never assumed).
+    if (!resampleUniform(buffer_, 1, x, fs) || fs < 2.0 * cfg_.highHz + 0.5) {
         metrics_.valid = false;
         return metrics_;
     }
     metrics_.sampleRate = fs;
 
-    // 2. Normalise to relative intensity change, then zero-mean detrend.
-    const double mean = std::accumulate(x.begin(), x.end(), 0.0) / static_cast<double>(n);
-    if (mean > 1e-6)
-        for (double& v : x) v = v / mean - 1.0;
+    // 2. Pulse synthesis: POS on colour input, otherwise normalised green.
+    const bool usePos = cfg_.method == PulseMethod::POS && !scalarInput_;
+    metrics_.method = usePos ? PulseMethod::POS : PulseMethod::Green;
+    if (usePos) {
+        std::vector<double> b, r;
+        double fsB = 0.0, fsR = 0.0;
+        resampleUniform(buffer_, 0, b, fsB);
+        resampleUniform(buffer_, 2, r, fsR);
+        x = pos(b, x, r, static_cast<int>(std::lround(cfg_.posWindowSec * fs)));
+    } else {
+        const double mean = std::accumulate(x.begin(), x.end(), 0.0) / static_cast<double>(n);
+        if (mean > 1e-6)
+            for (double& v : x) v = v / mean - 1.0;
+    }
+    // Zero-mean moving-average detrend (removes residual baseline before the band-pass).
     detrend(x, static_cast<int>(std::lround(cfg_.detrendWindowSec * fs)));
 
     // 3. Zero-phase Butterworth band-pass.
@@ -475,10 +577,30 @@ const SignalMetrics& SignalProcessor::process() {
 
     // 4–5. Spectrum → HR, peaks → IBI / RMSSD.
     std::vector<double> peaks;
-    if (n >= cfg_.minSamples) {
+    if (span >= cfg_.minSeconds) {
         Spectrum sp;
-        if (spectrum(x, fs, cfg_.lowHz, cfg_.highHz, cfg_.confLobeHz, cfg_.dftMinSize, sp)) {
-            const double peakHz = sp.peakHz;
+        const double prevHz = smoothedBpm_ > 0.0 ? smoothedBpm_ / 60.0 : 0.0;
+        if (spectrum(x, fs, cfg_.lowHz, cfg_.highHz, cfg_.confLobeHz, cfg_.dftMinSize, sp, 0.0, 0.0,
+                     prevHz, cfg_.trackSigmaBpm / 60.0, cfg_.trackFloor)) {
+            double peakHz = sp.peakHz;
+            // Re-acquisition: the tracking prior suppresses transient jumps, but if the
+            // strongest peak (no prior) keeps disagreeing for reacquireSec, the tracker is
+            // locked on the wrong peak (e.g. a harmonic) — re-lock onto the strongest one.
+            const double tNow = buffer_.back().t;
+            if (std::abs(sp.rawPeakHz - peakHz) * 60.0 > cfg_.trackSigmaBpm) {
+                if (disagreeSince_ < 0.0) disagreeSince_ = tNow;
+                if (tNow - disagreeSince_ >= cfg_.reacquireSec) {
+                    Spectrum fresh;
+                    if (spectrum(x, fs, cfg_.lowHz, cfg_.highHz, cfg_.confLobeHz, cfg_.dftMinSize, fresh)) {
+                        sp = fresh;
+                        peakHz = fresh.peakHz;
+                        smoothedBpm_ = peakHz * 60.0;
+                    }
+                    disagreeSince_ = -1.0;
+                }
+            } else {
+                disagreeSince_ = -1.0;
+            }
             metrics_.instantBpm = peakHz * 60.0;
             metrics_.snrDb = sp.snrDb;
             // Confidence = (peak power / total band power) · normalisation, hard-clamped to [0, 1].
@@ -490,6 +612,11 @@ const SignalMetrics& SignalProcessor::process() {
             metrics_.bpm = smoothedBpm_;
             metrics_.valid = true;
             computeHrv(x, fs, peakHz, peaks);
+        } else {
+            // No genuine spectral peak in the band (only edge leakage / flat noise):
+            // report "no estimate" instead of freezing the previous number on screen.
+            metrics_.valid = false;
+            metrics_.confidence = 0.0;
         }
     } else {
         metrics_.valid = false;

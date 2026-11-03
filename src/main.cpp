@@ -46,6 +46,7 @@ const char* kKeys =
     "{buffer         | 512  | rPPG buffer length in samples (256-512)              }"
     "{mirror         | true | mirror the preview (selfie view)                     }"
     "{headless       | false| no window; print telemetry to stdout                 }"
+    "{method         | pos  | pulse extraction: pos (illumination robust) or green }"
     "{save           |      | write the HUD preview to a video file (e.g. out.mp4)  }"
     "{log            | 0    | print telemetry every N seconds (0 = off)            }"
     "{max-motion     | 0.08 | face motion (x IOD per frame) that pauses sampling   }";
@@ -158,6 +159,8 @@ int main(int argc, char** argv) {
 
         vitals::SignalConfig scfg;
         scfg.bufferSize = static_cast<std::size_t>(bufferLen);
+        const std::string method = parser.get<std::string>("method");
+        scfg.method = method == "green" ? vitals::PulseMethod::Green : vitals::PulseMethod::POS;
         vitals::SignalProcessor signal(scfg);
         vitals::OcularAnalyzer ocular;
         vitals::TelemetryUI ui;
@@ -231,9 +234,10 @@ int main(int argc, char** argv) {
             std::string status;
             if (face.valid) {
                 const bool stable = face.motion <= maxMotion;
-                if (stable) {
-                    const cv::Scalar m = cv::mean(frame(face.forehead));
-                    signal.push(m[1], t);  // green channel (BGR index 1)
+                cv::Vec3d skin;
+                if (stable && vitals::SignalProcessor::skinMean(
+                                  frame, {face.forehead, face.leftCheek, face.rightCheek}, skin)) {
+                    signal.push(skin, t);  // B, G, R → POS (or green in --method=green)
                 } else {
                     // Gross motion corrupts the rPPG trace: hold the buffer briefly.
                     signal.pause(t);

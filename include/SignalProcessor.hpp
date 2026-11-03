@@ -2,12 +2,19 @@
 // ============================================================================
 //  SignalProcessor — remote photoplethysmography (rPPG) DSP pipeline.
 //
-//   raw green mean ─► circular buffer (value, timestamp)
-//                  ─► uniform resampling (handles jittery camera FPS)
+//   skin-masked mean RGB (forehead + cheeks) ─► circular buffer (BGR, timestamp)
+//                  ─► uniform resampling at the *measured* rate (variable FPS safe)
+//                  ─► POS projection (Wang et al., IEEE TBME 2017): per 1.6 s window
+//                     normalise each channel by its temporal mean, project onto the
+//                     plane orthogonal to skin tone, alpha-tune, overlap-add.
+//                     Cancels intensity / auto-exposure changes common to R, G, B.
+//                     (Green-only mode remains available for comparison.)
 //                  ─► zero-mean detrending (moving-average baseline removal)
 //                  ─► zero-phase Butterworth band-pass 0.75–2.5 Hz (filtfilt)
 //                  ─► Hamming window + zero padding + cv::dft
-//                  ─► spectral peak (parabolic interpolation) ─► BPM
+//                  ─► peak = true local maximum of the full spectrum (never the
+//                     band edge), weighted toward the previous estimate (tracking)
+//                  ─► parabolic interpolation ─► BPM
 //                  ─► confidence = clamp(peak-lobe power / band power · norm, 0, 1)
 //                  ─► time-domain peak detection ─► IBI ─► RMSSD (HRV)
 //
@@ -20,6 +27,7 @@
 
 #include <cstddef>
 #include <deque>
+#include <utility>
 #include <vector>
 
 namespace vitals {
@@ -62,9 +70,16 @@ struct Biquad {
     void process(std::vector<double>& x) const;
 };
 
+enum class PulseMethod {
+    POS,    ///< Plane-Orthogonal-to-Skin chrominance (default, illumination robust)
+    Green,  ///< Mean green channel only (legacy, for comparison)
+};
+
 struct SignalConfig {
-    std::size_t bufferSize = 512;   ///< 256–512 samples ≈ 8.5–17 s @ 30 FPS.
-    std::size_t minSamples = 150;   ///< Samples before the first estimate (~5 s).
+    PulseMethod method = PulseMethod::POS;
+    std::size_t bufferSize = 512;   ///< 256–512 samples ≈ 17–25 s @ 20–30 FPS.
+    double minSeconds = 6.0;        ///< Data span before the first estimate (FPS independent).
+    double posWindowSec = 1.6;      ///< POS sliding window (≈ one cardiac cycle at 40 BPM).
     double lowHz = 0.75;            ///< 45 BPM
     double highHz = 2.5;            ///< 150 BPM
     int filterOrderSections = 2;    ///< Biquads per edge (2 → 4th-order HP + 4th-order LP).
@@ -73,6 +88,14 @@ struct SignalConfig {
     double maxGapSec = 2.0;         ///< Pauses longer than this flush the buffer.
     double bpmSmoothing = 0.25;     ///< EMA weight for the reported BPM.
     std::size_t waveformSeconds = 8;///< Length of filtered waveform exported to the UI.
+
+    // Peak tracking: a candidate's power is weighted by
+    //   trackFloor + (1 − trackFloor) · exp(−(ΔBPM / trackSigmaBpm)²)
+    // so a peak far from the previous estimate must be ≥ 1/trackFloor × stronger to win.
+    double trackSigmaBpm = 12.0;
+    double trackFloor = 0.5;
+    double reacquireSec = 3.0;      ///< If the unweighted strongest peak disagrees for this long,
+                                    ///< tracking re-locks onto it (prevents harmonic lock-in).
 
     // Confidence = clamp(lobePower / bandPower · confNorm, 0, 1).
     double confLobeHz = 0.12;       ///< Half-width of the "peak" lobe (Hamming main lobe).
@@ -90,7 +113,7 @@ struct SignalConfig {
     double respMinPeakDb = 10.0;       ///< Peak must exceed the reference median by this much.
     double respMinConfidence = 0.55;   ///< Below this the estimate is reported as invalid.
     double respSmoothing = 0.30;
-    std::size_t respStabilityFrames = 150;  ///< ≈ 5 s of consecutive estimates must agree.
+    double respStabilitySec = 5.0;     ///< Estimates over this span must agree (±1.5 BrPM).
 };
 
 struct SignalMetrics {
@@ -104,6 +127,7 @@ struct SignalMetrics {
     double meanIbiMs = 0.0;
     int beatCount = 0;
     double sampleRate = 0.0;    ///< Effective (measured) sampling rate.
+    PulseMethod method = PulseMethod::POS;  ///< Method actually used for this estimate.
     double bufferFill = 0.0;    ///< 0..1 progress of signal acquisition.
     // Respiration (breaths per minute).
     bool respValid = false;
@@ -119,8 +143,16 @@ class SignalProcessor {
 public:
     explicit SignalProcessor(const SignalConfig& cfg = SignalConfig{});
 
-    /// Add one raw sample (mean green intensity of the forehead ROI) at time t [s].
+    /// Add one colour sample (mean B, G, R of the skin ROIs) at time t [s].
+    void push(const cv::Vec3d& bgr, double t);
+    /// Scalar sample (e.g. green mean). Forces Green mode until reset(): POS needs colour.
     void push(double value, double t);
+
+    /// Skin-masked mean colour over several ROIs (pixel-count weighted). Pixels are kept
+    /// when they fall in a broad YCrCb skin range and are neither clipped nor in deep
+    /// shadow; if fewer than 25 % qualify (unusual lighting), the plain mean is used.
+    /// Returns false if no ROI has usable pixels.
+    static bool skinMean(const cv::Mat& bgrFrame, const std::vector<cv::Rect>& rois, cv::Vec3d& out);
     /// Signal that tracking is lost at time t; samples stop until the next push().
     void pause(double t);
     void reset();
@@ -130,25 +162,35 @@ public:
     const SignalMetrics& metrics() const { return metrics_; }
 
 private:
-    struct Sample { double v; double t; };
+    struct Sample { cv::Vec3d c; double t; };  ///< c = (B, G, R)
 
     struct Spectrum {
         double peakHz = 0.0;
         double ratio = 0.0;     ///< lobe power / total band power, 0..1
         double snrDb = 0.0;     ///< lobe power vs. remaining band power
         double peakToRefDb = 0.0; ///< peak bin vs. median bin of the reference band (if requested)
+        bool edgeOnly = false;    ///< band contained no true local maximum (only edge leakage)
+        double rawPeakHz = 0.0;   ///< strongest local maximum without the tracking prior
     };
 
-    static bool resampleUniform(const CircularBuffer<Sample>& buf, std::vector<double>& out, double& fs);
+    /// Resamples channel `ch` (0 = B, 1 = G, 2 = R) onto a uniform grid at the measured rate.
+    static bool resampleUniform(const CircularBuffer<Sample>& buf, int ch, std::vector<double>& out, double& fs);
+    /// POS pulse synthesis from uniformly sampled B, G, R traces.
+    static std::vector<double> pos(const std::vector<double>& b, const std::vector<double>& g,
+                                   const std::vector<double>& r, int window);
     static void detrend(std::vector<double>& x, int window);
     static void removeLinearTrend(std::vector<double>& x);
     /// Zero-phase Butterworth band-pass; `sections` biquads per edge.
     static void bandpass(std::vector<double>& x, double fs, double lo, double hi, int sections);
     /// Hamming + zero-padded cv::dft; peak search and power ratio inside [lo, hi].
     /// If refHi > refLo, also computes the peak-to-median ratio against that reference band.
+    /// Only true local maxima of the full spectrum are peak candidates, so monotonic leakage from
+    /// below the band can never "latch" onto the lower edge. If prevHz > 0, candidates are
+    /// weighted toward it (tracking) using trackSigmaHz / trackFloor.
     static bool spectrum(const std::vector<double>& x, double fs, double lo, double hi,
                          double lobeHz, int nfftMin, Spectrum& out, double refLo = 0.0,
-                         double refHi = 0.0);
+                         double refHi = 0.0, double prevHz = 0.0, double trackSigmaHz = 0.2,
+                         double trackFloor = 1.0);
     void processRespiration();
     void computeHrv(const std::vector<double>& x, double fs, double hrHz,
                     std::vector<double>& peakIdx);
@@ -161,12 +203,14 @@ private:
     bool paused_ = false;
     double pauseStart_ = 0.0;
     double timeOffset_ = 0.0;   ///< Accumulated removed pause time (keeps timeline contiguous).
-    double levelOffset_ = 0.0;  ///< DC re-alignment after a pause.
-    double lastRaw_ = 0.0;
+    cv::Vec3d levelOffset_{0, 0, 0};  ///< Per-channel DC re-alignment after a pause.
+    cv::Vec3d lastRaw_{0, 0, 0};
+    bool scalarInput_ = false;        ///< A scalar push() happened: POS not possible.
     double lastT_ = -1.0;
     double smoothedBpm_ = 0.0;
+    double disagreeSince_ = -1.0;  ///< Time the unweighted peak started disagreeing with tracking.
     double smoothedResp_ = 0.0;
-    std::deque<double> respHistory_;
+    std::deque<std::pair<double, double>> respHistory_;  ///< (t, BrPM)
 };
 
 }  // namespace vitals

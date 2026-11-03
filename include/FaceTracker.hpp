@@ -57,6 +57,10 @@ struct FaceObservation {
     cv::Rect forehead;
     cv::Rect leftEye;               ///< Eye appearing on the image-left side.
     cv::Rect rightEye;              ///< Eye appearing on the image-right side.
+    /// Malar (cheek) skin patches below each eye, lateral to the nose and above the mouth
+    /// corners: strongly perfused, so they add rPPG signal to the forehead.
+    cv::Rect leftCheek;
+    cv::Rect rightCheek;
     float interOcular = 0.f;        ///< Pixels, stabilised.
     float rollDeg = 0.f;
     float motion = 0.f;             ///< Normalised per-frame face displacement (×inter-ocular).
@@ -97,7 +101,7 @@ private:
     cv::Size detectorInput_{0, 0};
     cv::Mat scaled_, padded_, ycc_, rowMeans_;
 
-    RectEMA faceEma_, foreheadEma_, leftEyeEma_, rightEyeEma_;
+    RectEMA faceEma_, foreheadEma_, leftEyeEma_, rightEyeEma_, leftCheekEma_, rightCheekEma_;
     std::array<cv::Point2f, 5> lmState_{};
     bool lmInitialised_ = false;
     float iodState_ = 0.f;
