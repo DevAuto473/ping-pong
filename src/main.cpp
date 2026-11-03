@@ -46,6 +46,7 @@ const char* kKeys =
     "{buffer         | 512  | rPPG buffer length in samples (256-512)              }"
     "{mirror         | true | mirror the preview (selfie view)                     }"
     "{headless       | false| no window; print telemetry to stdout                 }"
+    "{save           |      | write the HUD preview to a video file (e.g. out.mp4)  }"
     "{log            | 0    | print telemetry every N seconds (0 = off)            }"
     "{max-motion     | 0.08 | face motion (x IOD per frame) that pauses sampling   }";
 
@@ -108,6 +109,10 @@ public:
         return secondsSince(t0);
     }
 
+    double fileFps() const {
+        const double f = cap_.get(cv::CAP_PROP_FPS);
+        return f > 1.0 ? f : 30.0;
+    }
     int consecutiveFailures() const { return failures_; }
     void release() { cap_.release(); }
 
@@ -136,6 +141,7 @@ int main(int argc, char** argv) {
     const bool headless = parser.get<bool>("headless");
     const double logEvery = parser.get<double>("log");
     const double maxMotion = parser.get<double>("max-motion");
+    const std::string savePath = parser.has("save") ? parser.get<std::string>("save") : "";
     const int bufferLen = std::max(256, std::min(512, parser.get<int>("buffer")));
     if (!parser.check()) {
         parser.printErrors();
@@ -174,6 +180,8 @@ int main(int argc, char** argv) {
         double reconnectDelay = 0.5;
         long frameIndex = 0;
         cv::Mat frame, gray;
+        cv::VideoWriter writer;  // opened lazily on the first rendered frame
+        bool saveTried = false;
         cv::Size lastSize(1280, 720);
 
         while (!gStop) {
@@ -253,7 +261,7 @@ int main(int argc, char** argv) {
                             om.blinkRate, om.incompleteBlinks, om.longClosures, om.perclos * 100.0);
                 std::fflush(stdout);
             }
-            if (headless) continue;
+            if (headless && savePath.empty()) continue;
 
             // ---- Render.
             vitals::UiFrameState ui_state;
@@ -265,6 +273,19 @@ int main(int argc, char** argv) {
             ui_state.ocular = &om;
             ui_state.statusMessage = status;
             ui.render(frame, ui_state);
+            if (!savePath.empty()) {
+                if (!writer.isOpened() && !saveTried) {
+                    saveTried = true;
+                    const double outFps = source.isFile() ? source.fileFps() : std::max(10.0, std::min(fps, 60.0));
+                    if (!writer.open(savePath, cv::VideoWriter::fourcc('m', 'p', '4', 'v'), outFps, frame.size())) {
+                        std::cerr << "[save] cannot create '" << savePath << "' — continuing without saving\n";
+                    } else {
+                        std::cout << "[save] writing HUD preview to " << savePath << '\n';
+                    }
+                }
+                if (writer.isOpened()) writer.write(frame);
+            }
+            if (headless) continue;
             cv::imshow(window, frame);
 
             const int key = cv::waitKey(1) & 0xFF;
@@ -278,6 +299,10 @@ int main(int argc, char** argv) {
             if (cv::getWindowProperty(window, cv::WND_PROP_VISIBLE) < 1.0) break;
         }
 
+        if (writer.isOpened()) {
+            writer.release();
+            std::cout << "[save] preview saved to " << savePath << '\n';
+        }
         source.release();
         if (!headless) cv::destroyAllWindows();
         std::cout << "Session ended cleanly.\n";
