@@ -121,7 +121,9 @@ void SignalProcessor::push(const cv::Vec3d& bgr, double t) {
 void SignalProcessor::push(const FrameSample& s, double t) {
     if (!std::isfinite(t)) return;
 
+    bool realigned = false;  // the splice below already re-aligned the DC level
     if (paused_) {
+        realigned = true;
         paused_ = false;
         const double gap = t - pauseStart_;
         if (buffer_.empty() || gap > cfg_.maxGapSec) {
@@ -150,6 +152,7 @@ void SignalProcessor::push(const FrameSample& s, double t) {
         const RoiSample& r = s.roi[k];
         const bool ok = r.valid && std::isfinite(r.bgr[0]) && std::isfinite(r.bgr[1]) && std::isfinite(r.bgr[2]);
         if (ok) {
+            if (r.moved && !realigned && haveRaw_[k]) levelOffset_[k] += lastRaw_[k] - r.bgr;
             smp.c[k] = r.bgr + levelOffset_[k];
             lastRaw_[k] = r.bgr;
             haveRaw_[k] = true;

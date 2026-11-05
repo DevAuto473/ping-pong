@@ -4,6 +4,7 @@
 #include "ClinicalAnalytics.hpp"
 #include "FaceTracker.hpp"
 #include "OcularAnalyzer.hpp"
+#include "QualityAdvisor.hpp"
 #include "SignalProcessor.hpp"
 #include "TelemetryUI.hpp"
 
@@ -12,11 +13,14 @@
 #include <opencv2/imgproc.hpp>
 #include <opencv2/videoio.hpp>
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <csignal>
 #include <cstdio>
+#include <ctime>
 #include <exception>
+#include <fstream>
 #include <iostream>
 #include <string>
 #include <thread>
@@ -54,7 +58,38 @@ const char* kKeys =
     "{max-rot-speed  | 30   | head rotation speed (deg/s) that pauses sampling     }"
     "{spo2-a         | 110  | SpO2 = A - B*R calibration intercept (uncalibrated)  }"
     "{spo2-b         | 25   | SpO2 = A - B*R calibration slope (uncalibrated)      }"
-    "{report         | true | print the clinical telemetry report on exit         }";
+    "{report         | true | print the clinical telemetry report on exit         }"
+    "{report-file    |      | also write the text report to this file              }"
+    "{json           |      | write a machine-readable JSON session summary        }"
+    "{csv            |      | write a time series (CSV) of all measurements        }"
+    "{csv-interval   | 1.0  | seconds between CSV rows                             }"
+    "{tips           | true | show acquisition tips (move closer, add light, ...)   }"
+    "{drowsy-alert   | true | flash an alert on micro-sleeps / high PERCLOS        }";
+
+/// Local time stamp for file names, e.g. 20261105_143012.
+std::string timeStamp() {
+    const std::time_t now = std::time(nullptr);
+    std::tm tm{};
+#if defined(_WIN32)
+    localtime_s(&tm, &now);
+#else
+    localtime_r(&now, &tm);
+#endif
+    char buf[32];
+    std::strftime(buf, sizeof(buf), "%Y%m%d_%H%M%S", &tm);
+    return buf;
+}
+
+bool writeTextFile(const std::string& path, const std::string& content, const char* what) {
+    std::ofstream f(path, std::ios::binary);
+    if (f) f << content;
+    if (!f) {
+        std::cerr << "[" << what << "] cannot write '" << path << "'\n";
+        return false;
+    }
+    std::cout << "[" << what << "] saved to " << path << '\n';
+    return true;
+}
 
 /// Camera / video source with automatic reconnection.
 class FrameSource {
@@ -108,7 +143,8 @@ public:
     double timestamp(const Clock::time_point& t0, long frameIndex) const {
         if (isFile()) {
             const double ms = cap_.get(cv::CAP_PROP_POS_MSEC);
-            if (ms > 0.0) return ms / 1000.0;
+            // Many backends report 0 ms for the first frame: that is a valid time stamp.
+            if (ms > 0.0 || (ms == 0.0 && frameIndex <= 1)) return ms / 1000.0;
             const double f = cap_.get(cv::CAP_PROP_FPS);
             return frameIndex / (f > 1.0 ? f : 30.0);
         }
@@ -150,10 +186,38 @@ int main(int argc, char** argv) {
     const double maxRotSpeed = parser.get<double>("max-rot-speed");
     const bool printReport = parser.get<bool>("report");
     const std::string savePath = parser.has("save") ? parser.get<std::string>("save") : "";
-    const int bufferLen = std::max(256, std::min(512, parser.get<int>("buffer")));
+    const int bufferArg = parser.get<int>("buffer");
+    const int bufferLen = std::max(256, std::min(512, bufferArg));
+    const std::string method = parser.get<std::string>("method");
+    const std::string reportFile = parser.has("report-file") ? parser.get<std::string>("report-file") : "";
+    const std::string jsonPath = parser.has("json") ? parser.get<std::string>("json") : "";
+    const std::string csvPath = parser.has("csv") ? parser.get<std::string>("csv") : "";
+    const double csvInterval = parser.get<double>("csv-interval");
+    const bool showTips = parser.get<bool>("tips");
+    const bool drowsyAlert = parser.get<bool>("drowsy-alert");
+    const int reqW = parser.get<int>("width"), reqH = parser.get<int>("height");
+    const double reqFps = parser.get<double>("fps");
     if (!parser.check()) {
         parser.printErrors();
         return 2;
+    }
+    // ---- Argument validation: fail early with a clear message instead of misbehaving later.
+    {
+        std::string err;
+        if (method != "pos" && method != "green") err = "--method must be 'pos' or 'green' (got '" + method + "')";
+        else if (camIndex < 0) err = "--camera must be >= 0";
+        else if (reqW <= 0 || reqH <= 0) err = "--width / --height must be positive";
+        else if (!(reqFps > 0.0)) err = "--fps must be positive";
+        else if (!(maxMotion > 0.0)) err = "--max-motion must be positive";
+        else if (!(maxRotSpeed > 0.0)) err = "--max-rot-speed must be positive";
+        else if (logEvery < 0.0) err = "--log must be >= 0";
+        else if (!(csvInterval > 0.0)) err = "--csv-interval must be positive";
+        if (!err.empty()) {
+            std::cerr << "[args] " << err << "\n";
+            return 2;
+        }
+        if (bufferArg != bufferLen)
+            std::cerr << "[args] --buffer " << bufferArg << " clamped to " << bufferLen << " (valid 256-512)\n";
     }
 
     std::signal(SIGINT, onSignal);
@@ -166,7 +230,6 @@ int main(int argc, char** argv) {
 
         vitals::SignalConfig scfg;
         scfg.bufferSize = static_cast<std::size_t>(bufferLen);
-        const std::string method = parser.get<std::string>("method");
         scfg.method = method == "green" ? vitals::PulseMethod::Green : vitals::PulseMethod::POS;
         vitals::SignalProcessor signal(scfg);
         vitals::OcularAnalyzer ocular;
@@ -175,9 +238,20 @@ int main(int argc, char** argv) {
         ccfg.spo2B = parser.get<double>("spo2-b");
         vitals::ClinicalAnalytics analytics(ccfg);
         vitals::TelemetryUI ui;
+        vitals::QualityAdvisor advisor;
+        vitals::DrowsinessMonitor drowsy;
 
-        FrameSource source(camIndex, video, parser.get<int>("width"), parser.get<int>("height"),
-                           parser.get<double>("fps"));
+        std::ofstream csv;
+        if (!csvPath.empty()) {
+            csv.open(csvPath, std::ios::binary);
+            if (!csv) {
+                std::cerr << "[csv] cannot create '" << csvPath << "'\n";
+                return 1;
+            }
+            csv << vitals::ClinicalAnalytics::csvHeader() << '\n';
+        }
+
+        FrameSource source(camIndex, video, reqW, reqH, reqFps);
         if (!source.open()) {
             std::cerr << "[capture] cannot open " << (source.isFile() ? video : "camera " + std::to_string(camIndex))
                       << (source.isFile() ? "" : " — will keep retrying") << '\n';
@@ -197,6 +271,9 @@ int main(int argc, char** argv) {
         cv::VideoWriter writer;  // opened lazily on the first rendered frame
         bool saveTried = false;
         cv::Size lastSize(1280, 720);
+        double lastT = -1.0, lastCsv = -1e9;
+        bool userPaused = false, hudVisible = true;
+        std::array<cv::Rect, vitals::kRoiCount> prevRois{};
 
         while (!gStop) {
             bool eof = false;
@@ -231,7 +308,10 @@ int main(int argc, char** argv) {
             ++frameIndex;
             if (mirror && !source.isFile()) cv::flip(frame, frame, 1);
             lastSize = frame.size();
-            const double t = source.timestamp(t0, frameIndex);
+            double t = source.timestamp(t0, frameIndex);
+            // Guard against non-monotonic clocks (seek glitches, broken container time stamps).
+            if (lastT >= 0.0 && t <= lastT) t = lastT + 1.0 / (source.isFile() ? source.fileFps() : 30.0);
+            lastT = t;
 
             // ---- FPS (EMA of instantaneous rate, wall clock).
             const auto now = Clock::now();
@@ -244,34 +324,69 @@ int main(int argc, char** argv) {
             vitals::SystemState state = vitals::SystemState::Acquiring;
             std::string status;
             bool motionRejected = false;
-            if (face.valid) {
+            vitals::FrameSample sample;
+            bool haveSample = false;
+            if (userPaused) {
+                signal.pause(t);
+                ocular.pause(t);
+                state = vitals::SystemState::UserPaused;
+            } else if (face.valid) {
                 // Translation and head-rotation speed both corrupt the rPPG trace:
                 // freeze the buffers (they resume, spliced, once the head is still).
                 motionRejected = face.motion > maxMotion || face.angularSpeedDps > maxRotSpeed;
-                if (!motionRejected) {
-                    signal.push(vitals::SignalProcessor::sampleFrame(
-                                    frame, {face.forehead, face.leftCheek, face.rightCheek},
-                                    {face.backgroundLeft, face.backgroundRight}),
-                                t);
-                } else {
-                    signal.pause(t);
-                }
+                const std::array<cv::Rect, vitals::kRoiCount> rois{face.forehead, face.leftCheek, face.rightCheek};
+                sample = vitals::SignalProcessor::sampleFrame(frame, rois, {face.backgroundLeft, face.backgroundRight});
+                haveSample = true;
+                // A relocated (lock-released) ROI sees a different pixel set: flag it so the
+                // processor removes the colour step instead of treating it as signal.
+                for (int k = 0; k < vitals::kRoiCount; ++k)
+                    sample.roi[k].moved = prevRois[k].area() > 0 && rois[k] != prevRois[k];
+                prevRois = rois;
+                if (!motionRejected) signal.push(sample, t);
+                else signal.pause(t);
                 cv::cvtColor(frame, gray, cv::COLOR_BGR2GRAY);
                 ocular.update(gray, face.leftEye, face.rightEye, t);
             } else {
+                prevRois = {};
                 signal.pause(t);
                 ocular.pause(t);
                 state = vitals::SystemState::FaceLost;
                 status = "NO FACE DETECTED - BUFFERS PAUSED";
             }
             const vitals::SignalMetrics& sm = signal.process();
-            if (face.valid) state = sm.valid ? vitals::SystemState::Running : vitals::SystemState::Acquiring;
+            if (face.valid && !userPaused)
+                state = sm.valid ? vitals::SystemState::Running : vitals::SystemState::Acquiring;
 
             const vitals::OcularMetrics& om = ocular.metrics();
-            analytics.update(t, sm, om, face.valid, motionRejected);
+            if (!userPaused) analytics.update(t, sm, om, face.valid, motionRejected);
+
+            // ---- Acquisition tips + drowsiness alert (both debounced).
+            vitals::AdviceInput ain;
+            ain.face = &face;
+            ain.sample = haveSample ? &sample : nullptr;
+            ain.signal = &sm;
+            ain.motionRejected = motionRejected;
+            ain.fps = fps;
+            ain.offline = source.isFile();
+            const vitals::Advice advice = userPaused ? vitals::Advice::None : advisor.update(ain, t);
+            const bool wasDrowsy = drowsy.active();
+            const bool isDrowsy = drowsyAlert && !userPaused && drowsy.update(om, t);
+            analytics.setDrowsinessEpisodes(drowsy.episodes());
+            if (isDrowsy && !wasDrowsy) {
+                std::cerr << "[alert] t=" << t << " s DROWSINESS: " << drowsy.reason() << (headless ? "\a" : "")
+                          << '\n';
+            }
+
             if (logEvery > 0.0 && t - lastLog >= logEvery) {
                 lastLog = t;
-                std::cout << analytics.statusLine(t, sm, om, motionRejected) << std::endl;
+                std::cout << analytics.statusLine(t, sm, om, motionRejected);
+                if (advice != vitals::Advice::None) std::cout << " | tip: " << vitals::adviceText(advice);
+                std::cout << std::endl;
+            }
+            if (csv.is_open() && t - lastCsv >= csvInterval) {
+                lastCsv = t;
+                csv << analytics.csvRow(t, sm, om, face.valid, motionRejected, vitals::adviceId(advice), isDrowsy)
+                    << '\n';
             }
             if (headless && savePath.empty()) continue;
 
@@ -279,12 +394,14 @@ int main(int argc, char** argv) {
             vitals::UiFrameState ui_state;
             ui_state.state = state;
             ui_state.fps = fps;
-            ui_state.sessionSeconds = secondsSince(t0);
+            ui_state.sessionSeconds = source.isFile() ? t : secondsSince(t0);
             ui_state.face = &face;
             ui_state.signal = &sm;
             ui_state.ocular = &om;
             ui_state.statusMessage = status;
-            ui.render(frame, ui_state);
+            if (showTips && advice != vitals::Advice::None) ui_state.advice = vitals::adviceText(advice);
+            if (isDrowsy) ui_state.alert = drowsy.reason();
+            if (hudVisible) ui.render(frame, ui_state);
             if (!savePath.empty()) {
                 if (!writer.isOpened() && !saveTried) {
                     saveTried = true;
@@ -306,6 +423,20 @@ int main(int argc, char** argv) {
                 signal.reset();
                 ocular.reset();
                 tracker.reset();
+                analytics.reset();
+                advisor.reset();
+                drowsy.reset();
+                prevRois = {};
+                std::cout << "[reset] measurements cleared\n";
+            } else if (key == 'p' || key == 'P' || key == ' ') {
+                userPaused = !userPaused;
+                std::cout << (userPaused ? "[pause] measurement paused\n" : "[pause] measurement resumed\n");
+            } else if (key == 'h' || key == 'H') {
+                hudVisible = !hudVisible;
+            } else if (key == 's' || key == 'S') {
+                const std::string shot = "vitals_" + timeStamp() + ".png";
+                if (cv::imwrite(shot, frame)) std::cout << "[snapshot] saved " << shot << '\n';
+                else std::cerr << "[snapshot] cannot write " << shot << '\n';
             }
             // Window closed with the [x] button.
             if (cv::getWindowProperty(window, cv::WND_PROP_VISIBLE) < 1.0) break;
@@ -318,9 +449,17 @@ int main(int argc, char** argv) {
         source.release();
         if (!headless) cv::destroyAllWindows();
         // ESC / 'q' / window close / end of video / Ctrl+C all end up here.
-        if (printReport) std::cout << analytics.report() << std::flush;
+        if (csv.is_open()) {
+            csv.close();
+            std::cout << "[csv] time series saved to " << csvPath << '\n';
+        }
+        const std::string report = analytics.report();
+        if (printReport) std::cout << report << std::flush;
+        int rc = 0;
+        if (!reportFile.empty() && !writeTextFile(reportFile, report, "report")) rc = 1;
+        if (!jsonPath.empty() && !writeTextFile(jsonPath, analytics.reportJson(), "json")) rc = 1;
         std::cout << "Session ended cleanly.\n";
-        return 0;
+        return rc;
     } catch (const std::exception& e) {
         std::cerr << "[fatal] " << e.what() << '\n';
         return 1;

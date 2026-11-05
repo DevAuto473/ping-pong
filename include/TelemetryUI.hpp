@@ -12,7 +12,7 @@
 
 namespace vitals {
 
-enum class SystemState { Running, Acquiring, FaceLost, CameraLost };
+enum class SystemState { Running, Acquiring, FaceLost, CameraLost, UserPaused };
 
 struct UiFrameState {
     SystemState state = SystemState::Acquiring;
@@ -22,6 +22,8 @@ struct UiFrameState {
     const SignalMetrics* signal = nullptr;
     const OcularMetrics* ocular = nullptr;
     std::string statusMessage;
+    std::string advice;        ///< Debounced acquisition hint ("" = none).
+    std::string alert;         ///< Drowsiness alert reason ("" = none); flashes on screen.
 };
 
 class TelemetryUI {
@@ -42,6 +44,8 @@ private:
     void drawWaveform(cv::Mat& frame, const cv::Rect& area, const SignalMetrics& m,
                       bool paused) const;
     void drawBanner(cv::Mat& frame, const std::string& text, const cv::Scalar& color) const;
+    void drawAdvice(cv::Mat& frame, const std::string& text, int bottomY) const;
+    void drawAlert(cv::Mat& frame, const std::string& reason, double t, int rightBound) const;
 };
 
 }  // namespace vitals

@@ -109,7 +109,8 @@ add_library(vitals_core STATIC
     src/SignalProcessor.cpp
     src/OcularAnalyzer.cpp
     src/TelemetryUI.cpp
-    src/ClinicalAnalytics.cpp)
+    src/ClinicalAnalytics.cpp
+    src/QualityAdvisor.cpp)
 target_include_directories(vitals_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(vitals_core PUBLIC ${OpenCV_LIBS})
 target_compile_options(vitals_core PRIVATE ${VITALS_WARNINGS} $<$<CONFIG:Release>:${VITALS_OPT}>)
@@ -154,4 +155,7 @@ if(VITALS_BUILD_TESTS)
     add_executable(vitals_clinical_tests tests/test_clinical.cpp)
     target_link_libraries(vitals_clinical_tests PRIVATE vitals_core)
     add_test(NAME vitals_clinical COMMAND vitals_clinical_tests)
+    add_executable(vitals_feature_tests tests/test_features.cpp)
+    target_link_libraries(vitals_feature_tests PRIVATE vitals_core)
+    add_test(NAME vitals_features COMMAND vitals_feature_tests)
 endif()

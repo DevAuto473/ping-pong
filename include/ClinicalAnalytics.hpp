@@ -108,6 +108,18 @@ public:
                            bool motionRejected) const;
     /// End-of-session English report.
     std::string report() const;
+    /// Machine-readable session summary (JSON object; unavailable values are null).
+    std::string reportJson() const;
+
+    /// CSV time series (one row per call, typically 1 Hz). Empty cells = not available.
+    static std::string csvHeader();
+    std::string csvRow(double t, const SignalMetrics& sm, const OcularMetrics& om, bool faceTracked,
+                       bool motionRejected, const char* advice, bool drowsy) const;
+
+    /// Discards all session statistics (keeps the configuration).
+    void reset() { *this = ClinicalAnalytics(cfg_); }
+    /// Drowsiness alert episodes, reported in the session summary.
+    void setDrowsinessEpisodes(int n) { drowsyEpisodes_ = n; }
 
     // Pure analysis kernels (public for unit tests).
     static HrvSummary analyseHrv(const std::vector<BeatEvent>& beats, const ClinicalConfig& cfg);
@@ -116,6 +128,10 @@ public:
 
 private:
     void periodicAnalysis(const SignalMetrics& sm);
+    /// Session respiration rate. The validated baseline-modulation estimate (peak prominence,
+    /// zero-crossing agreement, stability) is preferred; the RSA peak of the HRV spectrum is
+    /// only a fallback, and is rejected when it sits on the HF band edge (noise, not breathing).
+    bool respiration(double& brpm, std::string& source) const;
     static double median(std::vector<double> v);
 
     ClinicalConfig cfg_;
@@ -131,6 +147,8 @@ private:
     std::vector<BeatEvent> beats_;
     std::vector<double> ratioSamples_, respSamples_;
     std::vector<double> baSamples_, agiSamples_, riseSamples_, crestSamples_, riSamples_;
+
+    int drowsyEpisodes_ = 0;
 
     HrvSummary hrv_;
     ApgSummary apgLatest_;

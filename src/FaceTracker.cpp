@@ -28,6 +28,16 @@ cv::Rect2f centeredRect(const cv::Point2f& c, float w, float h) {
 
 inline float norm2(const cv::Point2f& p) { return std::sqrt(p.x * p.x + p.y * p.y); }
 
+/// Keeps `prev` unless `cand` moved / resized by more than `tol` pixels.
+cv::Rect lockRect(const cv::Rect& prev, const cv::Rect& cand, float tol) {
+    if (tol <= 0.f || prev.area() <= 0 || cand.area() <= 0) return cand;
+    const float dx = 0.5f * static_cast<float>((cand.x + cand.br().x) - (prev.x + prev.br().x));
+    const float dy = 0.5f * static_cast<float>((cand.y + cand.br().y) - (prev.y + prev.br().y));
+    const float dw = static_cast<float>(std::abs(cand.width - prev.width));
+    const float dh = static_cast<float>(std::abs(cand.height - prev.height));
+    return (std::hypot(dx, dy) > tol || dw > tol || dh > tol) ? cand : prev;
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -233,7 +243,8 @@ void FaceTracker::computeRois(const cv::Mat& frame, const cv::Size& frameSize) {
     const cv::Rect2f lMeasure = centeredRect(eL - up * (0.02f * d), ew, eh);
     const cv::Rect2f rMeasure = centeredRect(eR - up * (0.02f * d), ew, eh);
 
-    last_.forehead = clipRect(foreheadEma_.update(fhMeasure), frameSize);
+    const float lockTol = cfg_.roiLockIod > 0.f ? std::max(1.5f, cfg_.roiLockIod * d) : 0.f;
+    last_.forehead = lockRect(last_.forehead, clipRect(foreheadEma_.update(fhMeasure), frameSize), lockTol);
     last_.leftEye = clipRect(leftEyeEma_.update(lMeasure), frameSize);
     last_.rightEye = clipRect(rightEyeEma_.update(rMeasure), frameSize);
 
@@ -245,8 +256,8 @@ void FaceTracker::computeRois(const cv::Mat& frame, const cv::Size& frameSize) {
     const float cw = 0.38f * d, ch = 0.30f * d;
     const cv::Rect2f lcMeasure = centeredRect(eL + down * (0.62f * d) - outward * (0.06f * d), cw, ch);
     const cv::Rect2f rcMeasure = centeredRect(eR + down * (0.62f * d) + outward * (0.06f * d), cw, ch);
-    last_.leftCheek = clipRect(leftCheekEma_.update(lcMeasure), frameSize);
-    last_.rightCheek = clipRect(rightCheekEma_.update(rcMeasure), frameSize);
+    last_.leftCheek = lockRect(last_.leftCheek, clipRect(leftCheekEma_.update(lcMeasure), frameSize), lockTol);
+    last_.rightCheek = lockRect(last_.rightCheek, clipRect(rightCheekEma_.update(rcMeasure), frameSize), lockTol);
     last_.interOcular = d;
     last_.rollDeg = roll * 180.f / kPi;
 }

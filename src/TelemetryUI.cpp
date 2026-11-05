@@ -118,6 +118,7 @@ void TelemetryUI::drawHeader(cv::Mat& frame, const UiFrameState& st) const {
         }
         case SystemState::FaceLost: badge = "FACE LOST - BUFFERS PAUSED"; col = kRed; break;
         case SystemState::CameraLost: badge = "CAMERA OFFLINE"; col = kRed; break;
+        case SystemState::UserPaused: badge = "PAUSED - PRESS P"; col = kAmber; break;
     }
     int bl = 0;
     const cv::Size bs = cv::getTextSize(badge, kFont, 0.5 * s, 1, &bl);
@@ -148,7 +149,7 @@ void TelemetryUI::drawCards(cv::Mat& frame, const cv::Rect& panel, const UiFrame
     const int cardH = (panel.height - (kCards - 1) * gap) / kCards;
     // All offsets inside a card scale with the card height (designed for 112 px @ 720p).
     const double s = std::min(base, base * cardH / (112.0 * base));
-    const bool paused = st.state == SystemState::FaceLost;
+    const bool paused = st.state == SystemState::FaceLost || st.state == SystemState::UserPaused;
     const SignalMetrics* sig = st.signal;
     const OcularMetrics* oc = st.ocular;
     const auto pct = [](double v) { return std::clamp(v, 0.0, 1.0) * 100.0; };  // never > 100 %
@@ -182,7 +183,7 @@ void TelemetryUI::drawCards(cv::Mat& frame, const cv::Rect& panel, const UiFrame
             const cv::Point c(r.x + r.width - (int)(30 * s), r.y + (int)(42 * s));
             cv::circle(frame, c, (int)((6 + 5 * a) * s), kRed, cv::FILLED, cv::LINE_AA);
         }
-        const cv::Rect cb(r.x + (int)(14 * s), r.y + r.height - (int)(20 * s), r.width - (int)(90 * s),
+        const cv::Rect cb(r.x + (int)(14 * s), r.y + r.height - (int)(20 * s), r.width - (int)(100 * s),
                           std::max(3, (int)(5 * s)));
         bar(frame, cb, conf, accent);
         text(frame, fmt("CONF %.0f%%", pct(conf)), {cb.x + cb.width + (int)(8 * s), cb.y + (int)(7 * s)},
@@ -346,6 +347,42 @@ void TelemetryUI::drawBanner(cv::Mat& frame, const std::string& msg, const cv::S
     text(frame, msg, {r.x + (int)(20 * s), r.y + (int)(31 * s)}, 0.7 * s, color, 1, kFontBold);
 }
 
+void TelemetryUI::drawAdvice(cv::Mat& frame, const std::string& msg, int bottomY) const {
+    const double s = frame.rows / 720.0;
+    const std::string txt = "TIP: " + msg;
+    int bl = 0;
+    const cv::Size ts = cv::getTextSize(txt, kFontBold, 0.55 * s, 1, &bl);
+    const int pad = static_cast<int>(10 * s);
+    const cv::Rect r(static_cast<int>(12 * s), bottomY - ts.height - 2 * pad, ts.width + 2 * pad,
+                     ts.height + 2 * pad);
+    blendRect(frame, r, kBg, 0.8);
+    cv::rectangle(frame, r, kAmber, 1, cv::LINE_AA);
+    text(frame, txt, {r.x + pad, r.y + pad + ts.height}, 0.55 * s, kAmber, 1, kFontBold);
+}
+
+void TelemetryUI::drawAlert(cv::Mat& frame, const std::string& reason, double t, int rightBound) const {
+    const double s = frame.rows / 720.0;
+    // Red frame + flashing banner (2 Hz) — hard to miss, even in peripheral vision.
+    const bool on = std::fmod(t, 0.5) < 0.3;
+    const int th = std::max(4, static_cast<int>(8 * s));
+    cv::rectangle(frame, cv::Rect(0, 0, frame.cols, frame.rows), on ? kRed : kAmber, th);
+    const std::string msg = "DROWSINESS ALERT: " + reason;
+    // Centred over the video area (left of the card panel); shrink the text if it does not fit.
+    const int avail = std::max(1, rightBound - (int)(24 * s));
+    double scale = 0.8 * s;
+    int bl = 0;
+    cv::Size ts = cv::getTextSize(msg, kFontBold, scale, 2, &bl);
+    if (ts.width + (int)(40 * s) > avail) {
+        scale *= static_cast<double>(avail - (int)(40 * s)) / std::max(1, ts.width);
+        ts = cv::getTextSize(msg, kFontBold, scale, 2, &bl);
+    }
+    const cv::Rect r(std::max(0, (rightBound - ts.width) / 2 - (int)(20 * s)), (int)(60 * s),
+                     ts.width + (int)(40 * s), ts.height + (int)(26 * s));
+    blendRect(frame, r, on ? kRed : kBg, 0.85);
+    cv::rectangle(frame, r, kText, 1, cv::LINE_AA);
+    text(frame, msg, {r.x + (int)(20 * s), r.y + r.height - (int)(13 * s)}, scale, kText, 2, kFontBold);
+}
+
 void TelemetryUI::render(cv::Mat& frame, const UiFrameState& st) const {
     if (frame.empty()) return;
     const double s = frame.rows / 720.0;
@@ -361,10 +398,16 @@ void TelemetryUI::render(cv::Mat& frame, const UiFrameState& st) const {
     const cv::Rect panel(frame.cols - panelW - margin, headerH + margin, panelW,
                          wave.y - headerH - 2 * margin);
     drawCards(frame, panel, st);
-    if (st.signal) drawWaveform(frame, wave, *st.signal, st.state == SystemState::FaceLost);
+    const bool paused = st.state == SystemState::FaceLost || st.state == SystemState::UserPaused;
+    if (st.signal) drawWaveform(frame, wave, *st.signal, paused);
 
     if (st.state == SystemState::FaceLost)
         drawBanner(frame, st.statusMessage.empty() ? "NO FACE DETECTED" : st.statusMessage, kRed);
+    else if (st.state == SystemState::UserPaused)
+        drawBanner(frame, "MEASUREMENT PAUSED - PRESS P TO RESUME", kAmber);
+    if (!st.advice.empty() && st.state != SystemState::FaceLost && st.state != SystemState::UserPaused)
+        drawAdvice(frame, st.advice, wave.y - (int)(24 * s));
+    if (!st.alert.empty()) drawAlert(frame, st.alert, st.sessionSeconds, panel.x);
 
     text(frame, "Research prototype - not a medical device",
          {margin, wave.y - (int)(8 * s)}, 0.38 * s, kMuted, 1);

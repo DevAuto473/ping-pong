@@ -41,6 +41,11 @@ struct FaceTrackerConfig {
     float roiAlpha = 0.25f;         ///< EMA weight of new measurement for ROI boxes (0..1].
     float landmarkAlpha = 0.35f;    ///< EMA weight for landmark points.
     int maxMissedFrames = 6;        ///< Detector misses tolerated (coasting) before "lost".
+    /// rPPG ROI lock: the published forehead / cheek rectangles only move once the stabilised
+    /// box has drifted more than this fraction of the inter-ocular distance (min 1.5 px). A
+    /// 1-px jump of a small ROI swaps several % of its pixels and injects a colour step that
+    /// masquerades as pulse / HRV; 0 disables the lock.
+    float roiLockIod = 0.04f;
     int backend = 0;                ///< cv::dnn::Backend
     int target = 0;                 ///< cv::dnn::Target
 };

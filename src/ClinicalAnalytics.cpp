@@ -110,6 +110,24 @@ void ClinicalAnalytics::periodicAnalysis(const SignalMetrics& sm) {
     }
 }
 
+bool ClinicalAnalytics::respiration(double& brpm, std::string& source) const {
+    // HF band = 0.15–0.40 Hz = 9–24 BrPM; a maximum within 0.6 BrPM of an edge is not a peak.
+    const bool rsaOk = hrv_.freqValid && hrv_.rsaBrpm > 9.6 && hrv_.rsaBrpm < 23.4;
+    if (!respSamples_.empty()) {
+        brpm = median(respSamples_);
+        source = rsaOk && std::abs(hrv_.rsaBrpm - brpm) <= 3.0
+                     ? "rPPG baseline modulation, confirmed by RSA"
+                     : "rPPG baseline modulation";
+        return true;
+    }
+    if (rsaOk) {
+        brpm = hrv_.rsaBrpm;
+        source = "Respiratory Sinus Arrhythmia";
+        return true;
+    }
+    return false;
+}
+
 bool ClinicalAnalytics::spo2(double& percent, double& ratio) const {
     if (ratioSamples_.empty()) return false;
     ratio = median(ratioSamples_);
@@ -523,10 +541,10 @@ std::string ClinicalAnalytics::report() const {
 
     // ---- Respiratory & ocular --------------------------------------------------
     o << "\n[ RESPIRATORY & OCULAR FATIGUE ]\n";
-    if (hrv_.freqValid && hrv_.rsaBrpm > 0.0)
-        line("- Respiration Rate:", fmt("%.1f BrPM (Derived from Respiratory Sinus Arrhythmia)", hrv_.rsaBrpm));
-    else if (!respSamples_.empty())
-        line("- Respiration Rate:", fmt("%.1f BrPM (Derived from rPPG baseline modulation)", median(respSamples_)));
+    double rr = 0.0;
+    std::string rrSource;
+    if (respiration(rr, rrSource))
+        line("- Respiration Rate:", fmt("%.1f BrPM", rr) + " (Derived from " + rrSource + ")");
     else
         line("- Respiration Rate:", "N/A (no stable respiratory component)");
 
@@ -545,10 +563,104 @@ std::string ClinicalAnalytics::report() const {
         line("- PERCLOS Index:", "N/A");
     }
 
+    if (ocMin > 0.1) line("- Drowsiness Alerts:", std::to_string(drowsyEpisodes_) + " episode(s)");
+
     o << '\n' << rule << '\n'
       << "             NOTICE: FOR RESEARCH & MONITORING PURPOSES ONLY.\n"
       << "   Not a medical device. SpO2 is uncalibrated.\n"
       << rule << '\n';
+    return o.str();
+}
+
+// ---------------------------------------------------------------------------
+// CSV time series
+// ---------------------------------------------------------------------------
+std::string ClinicalAnalytics::csvHeader() {
+    return "t_s,face,motion,hr_bpm,hr_conf,sqi,sqi_forehead,sqi_lcheek,sqi_rcheek,"
+           "rmssd_window_ms,rmssd_session_ms,sdnn_session_ms,lf_hf,resp_brpm,resp_conf,"
+           "blink_rate_min,blinks,incomplete_blinks,perclos_pct,ear,eyes_closed,ambient,advice,drowsy";
+}
+
+std::string ClinicalAnalytics::csvRow(double t, const SignalMetrics& sm, const OcularMetrics& om,
+                                      bool faceTracked, bool motionRejected, const char* advice,
+                                      bool drowsy) const {
+    std::ostringstream o;
+    const auto num = [&](bool ok, const char* f, double v) {
+        o << ',';
+        if (ok && std::isfinite(v)) o << fmt(f, v);
+    };
+    o << fmt("%.3f", t) << ',' << (faceTracked ? 1 : 0) << ',' << (motionRejected ? 1 : 0);
+    const bool hr = sm.valid && !sm.paused;
+    num(hr, "%.1f", sm.bpm);
+    num(hr, "%.3f", sm.confidence);
+    num(hr, "%.3f", sm.sqi);
+    for (int k = 0; k < kRoiCount; ++k) num(hr, "%.3f", sm.roiSqi[static_cast<std::size_t>(k)]);
+    num(hr && sm.rmssdMs > 0.0, "%.1f", sm.rmssdMs);
+    num(hrv_.timeValid, "%.1f", hrv_.rmssdMs);
+    num(hrv_.timeValid, "%.1f", hrv_.sdnnMs);
+    num(hrv_.freqValid, "%.3f", hrv_.lfHf);
+    num(sm.respValid && !sm.paused, "%.1f", sm.respRate);
+    num(sm.respValid && !sm.paused, "%.3f", sm.respConfidence);
+    const bool oc = om.valid && !om.paused;
+    num(oc, "%.1f", om.blinkRate);
+    o << ',' << om.totalBlinks << ',' << om.incompleteBlinks;
+    num(oc, "%.2f", om.perclos * 100.0);
+    num(oc, "%.3f", om.ear);
+    o << ',' << (oc && om.eyesClosed ? 1 : 0) << ',' << (sm.ambientSuspect ? 1 : 0) << ','
+      << (advice ? advice : "") << ',' << (drowsy ? 1 : 0);
+    return o.str();
+}
+
+// ---------------------------------------------------------------------------
+// JSON summary
+// ---------------------------------------------------------------------------
+std::string ClinicalAnalytics::reportJson() const {
+    std::ostringstream o;
+    const auto num = [](bool ok, double v, const char* f = "%.2f") {
+        return ok && std::isfinite(v) ? fmt(f, v) : std::string("null");
+    };
+    const double dur = tFirst_ >= 0.0 ? std::max(0.0, tLast_ - tFirst_) : 0.0;
+    const bool hr = hrCount_ > 0;
+    double spo2v = 0.0, ratio = 0.0;
+    const bool sp = spo2(spo2v, ratio);
+    double rr = 0.0;
+    std::string rrSource;
+    const bool resp = respiration(rr, rrSource);
+    const double ocMin = ocular_.sessionTrackedSec / 60.0;
+    const bool oc = ocMin > 0.1;
+
+    o << "{\n"
+      << "  \"duration_s\": " << num(true, dur, "%.1f") << ",\n"
+      << "  \"frames\": " << frames_ << ",\n"
+      << "  \"tracked_frames\": " << trackedFrames_ << ",\n"
+      << "  \"motion_rejected_frames\": " << motionFrames_ << ",\n"
+      << "  \"mean_sqi\": " << num(sqiCount_ > 0, sqiCount_ > 0 ? sqiSum_ / sqiCount_ : 0.0, "%.3f") << ",\n"
+      << "  \"ambient_suspect_pct\": "
+      << num(ambientChecked_ > 0, ambientChecked_ > 0 ? 100.0 * ambientSuspect_ / ambientChecked_ : 0.0, "%.1f")
+      << ",\n"
+      << "  \"heart_rate\": {\"mean_bpm\": " << num(hr, hr ? hrSum_ / hrCount_ : 0.0, "%.1f")
+      << ", \"min_bpm\": " << num(hr, hrMin_, "%.1f") << ", \"max_bpm\": " << num(hr, hrMax_, "%.1f") << "},\n"
+      << "  \"hrv\": {\"nn_intervals\": " << hrv_.nnCount << ", \"rmssd_ms\": " << num(hrv_.timeValid, hrv_.rmssdMs, "%.1f")
+      << ", \"sdnn_ms\": " << num(hrv_.timeValid, hrv_.sdnnMs, "%.1f")
+      << ", \"sd1_ms\": " << num(hrv_.poincareValid, hrv_.sd1Ms, "%.1f")
+      << ", \"sd2_ms\": " << num(hrv_.poincareValid, hrv_.sd2Ms, "%.1f")
+      << ", \"lf_hf\": " << num(hrv_.freqValid, hrv_.lfHf, "%.3f")
+      << ", \"analysed_s\": " << num(true, hrv_.analysedSec, "%.1f")
+      << ", \"ectopic_beats\": " << hrv_.ectopicBeats
+      << ", \"irregular\": " << (hrv_.irregular ? "true" : "false") << "},\n"
+      << "  \"respiration_brpm\": " << num(resp, rr, "%.1f") << ",\n"
+      << "  \"respiration_source\": " << (resp ? "\"" + rrSource + "\"" : std::string("null")) << ",\n"
+      << "  \"spo2_uncalibrated_pct\": " << num(sp, spo2v, "%.1f") << ",\n"
+      << "  \"ratio_rb\": " << num(sp, ratio, "%.3f") << ",\n"
+      << "  \"apg_b_a\": " << num(!baSamples_.empty(), baSamples_.empty() ? 0.0 : median(baSamples_), "%.3f") << ",\n"
+      << "  \"ocular\": {\"blink_rate_min\": " << num(oc, oc ? ocular_.totalBlinks / ocMin : 0.0, "%.1f")
+      << ", \"blinks\": " << ocular_.totalBlinks << ", \"incomplete_blinks\": " << ocular_.incompleteBlinks
+      << ", \"long_closures\": " << ocular_.longClosures
+      << ", \"perclos_pct\": "
+      << num(oc, oc ? 100.0 * ocular_.sessionClosedSec / ocular_.sessionTrackedSec : 0.0, "%.2f")
+      << ", \"drowsiness_alerts\": " << drowsyEpisodes_ << "},\n"
+      << "  \"notice\": \"Research prototype, not a medical device. SpO2 is uncalibrated.\"\n"
+      << "}\n";
     return o.str();
 }
 

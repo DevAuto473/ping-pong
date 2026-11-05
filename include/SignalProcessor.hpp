@@ -82,6 +82,9 @@ struct RoiSample {
     cv::Vec3d bgr{0, 0, 0};
     double skinFraction = 1.0;  ///< Fraction of ROI pixels passing the skin gate.
     bool valid = false;
+    /// The ROI rectangle was relocated since the previous frame: the colour step caused by
+    /// the new pixel set is removed (DC re-alignment) instead of entering the pulse trace.
+    bool moved = false;
 };
 
 /// Everything the pipeline needs from one video frame.
